@@ -34,6 +34,7 @@ export default function WorkspaceLayout({
   isIngestActive,
   deletingDocName,
   onDelete,
+  onAccessChange,
   onRefresh,
   onIngestStart,
   onIngestEvent,
@@ -127,7 +128,9 @@ export default function WorkspaceLayout({
               <DocCard
                 key={i}
                 doc={doc}
-                onDelete={onDelete}
+                onDelete={['owner', 'admin'].includes(user.role) ? onDelete : null}
+                onAccessChange={['owner', 'admin'].includes(user.role) ? onAccessChange : null}
+                userRole={user.role}
                 isDeleting={deletingDocName === doc.name}
               />
             ))}
@@ -189,7 +192,7 @@ export default function WorkspaceLayout({
             Nexconn Channel
           </span>
           <span className="text-[10px]" style={{ color: 'var(--dc-text-muted)' }}>
-            · {user?.username ?? 'anonymous'}
+            · {user?.name ?? 'User'}
           </span>
         </div>
 
@@ -278,7 +281,7 @@ export default function WorkspaceLayout({
 
           {/* Tab content */}
           <div className="h-[calc(100%-37px)]">
-            {activeTab === 'pullrequests' && <DocumentPullRequest />}
+            {activeTab === 'pullrequests' && <DocumentPullRequest user={user} onComplete={onRefresh} />}
             {activeTab === 'metrics' && <CitationMetrics sources={lastSources} />}
           </div>
         </div>

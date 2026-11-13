@@ -35,6 +35,7 @@ export default function IngestProgressBanner({ ingestState, onDismiss }) {
   const isProcessing = status === 'processing';
   const isComplete = status === 'completed';
   const isFailed = status === 'failed';
+  const isPending = status === 'pending_approval';
   const isActive = isUploading || isProcessing;
 
   const currentIndex = isUploading ? -1 : getStageIndex(stage);
@@ -48,7 +49,7 @@ export default function IngestProgressBanner({ ingestState, onDismiss }) {
 
   const barStyle = isComplete ? { background: 'var(--dc-green)' } : isFailed ? { background: 'var(--dc-red)' } : { background: 'var(--dc-brand)' };
 
-  const title = isComplete
+  const title = isPending ? 'Waiting for approval' : isComplete
     ? 'Document added to knowledge base'
     : isFailed
       ? 'Ingestion failed'
@@ -79,7 +80,7 @@ export default function IngestProgressBanner({ ingestState, onDismiss }) {
           </div>
         </div>
 
-        {(isComplete || isFailed) && (
+        {(isComplete || isFailed || isPending) && (
           <button
             type="button"
             onClick={onDismiss}
@@ -92,7 +93,7 @@ export default function IngestProgressBanner({ ingestState, onDismiss }) {
         )}
       </div>
 
-      {!isFailed && (
+      {!isFailed && !isPending && (
         <div className="mb-3">
           <div className="flex items-center justify-between text-[10px] mb-1" style={{ color: 'var(--dc-text-muted)' }}>
             <span>Progress</span>
@@ -107,7 +108,7 @@ export default function IngestProgressBanner({ ingestState, onDismiss }) {
         </div>
       )}
 
-      {!isFailed && (
+      {!isFailed && !isPending && (
         <div className="flex items-center justify-between gap-1 pt-1">
               {INGEST_STEPS.map((step, index) => (
             <React.Fragment key={step.id}>

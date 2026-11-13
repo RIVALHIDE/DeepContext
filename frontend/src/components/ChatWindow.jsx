@@ -310,6 +310,7 @@ export default function ChatWindow({
 
         const response = await fetch(buildStreamUrl('/get-answer/stream'), {
           method: 'POST',
+          credentials: 'include',
           headers: {
             'Content-Type': 'application/json',
             Accept: 'text/event-stream',

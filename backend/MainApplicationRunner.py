@@ -14,8 +14,10 @@ from chat_history_manager import ChatHistroyManager
 from chat_session_manager import ChatSessionManager
 from database import initDB
 import supervisor
-from fastapi import FastAPI,File,UploadFile,HTTPException
+from fastapi import FastAPI,File,UploadFile,HTTPException,Form
 from fastapi.middleware.cors import CORSMiddleware
+from auth import (install_auth, current, require_role, session_owner, retrieval_scope, retrieval_filter,
+                  connect as auth_connect, ROLES)
 from office_loader import OFFICE_EXTENSIONS
 from pydantic import BaseModel
 
@@ -64,7 +66,11 @@ origin = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://10.121.162.97:5173",
+    *filter(None, os.getenv("AUTH_ALLOWED_ORIGINS", "").split(",")),
 ]
+
+initDB()
+install_auth(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -74,6 +80,8 @@ app.add_middleware(
     allow_methods=["*"],              # Allows all methods (GET, POST, etc.)
     allow_headers=["*"],              # Allows all headers
 )
+
+
 
 # ── Nexconn webhook router ─────────────────────────────────────────────────
 app.include_router(webhook_router)
@@ -147,7 +155,7 @@ def chroma_health_check():
     return check_chroma_health()
 
 @app.post("/upload")
-async def upload_docs(file: UploadFile = File(...)):
+async def upload_docs(file: UploadFile = File(...), access_role: str = Form("viewer")):
     """
     Hardened upload endpoint.
 
@@ -156,6 +164,9 @@ async def upload_docs(file: UploadFile = File(...)):
     ChromaDB ingestion is deferred until an admin approves the document.
     """
 
+    actor = require_role('member')
+    if access_role not in ROLES or ROLES[access_role] > ROLES[actor['role']]:
+        raise HTTPException(403, 'You cannot grant document access above your own role')
     # ── File size validation ──
     content = await file.read()
     file_size = len(content)
@@ -178,7 +189,14 @@ async def upload_docs(file: UploadFile = File(...)):
 
     # ── Save file to disk ──
     os.makedirs("./data", exist_ok=True)
-    file_path = os.path.join("./data", file.filename)
+    safe_name = os.path.basename((file.filename or '').replace('\\', '/'))
+    if not safe_name or safe_name in ('.', '..'):
+        raise HTTPException(422, 'A valid filename is required')
+    source_name = f"{actor['workspace_id']}__{safe_name}"
+    # Each upload has its own directory; pending uploads cannot overwrite each other.
+    upload_dir = os.path.join('./data', 'uploads', actor['workspace_id'], uuid.uuid4().hex)
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, source_name)
     with open(file_path, "wb") as buffer:
         buffer.write(content)
 
@@ -186,13 +204,16 @@ async def upload_docs(file: UploadFile = File(...)):
     document_id = str(uuid.uuid4())
     create_pending_upload(
         document_id=document_id,
-        source_name=file.filename,
+        source_name=source_name,
         file_path=file_path,
         file_size=file_size,
         mime_type=mime_type or ext,
-        uploaded_by="anonymous",
-        team_id="default",
+        uploaded_by=actor["id"],
+        team_id=actor["workspace_id"],
     )
+
+    with auth_connect() as db:
+        db.execute('UPDATE pending_uploads SET access_level=? WHERE document_id=?', (ROLES[access_role], document_id))
 
     return {
         "message": "Upload successful. Document is pending approval before ingestion.",
@@ -206,7 +227,14 @@ async def upload_docs(file: UploadFile = File(...)):
 @app.get("/pending-documents")
 def get_pending_documents():
     """List all documents awaiting approval."""
-    pending = list_pending_uploads()
+    actor = current()
+    pending = [record for record in list_pending_uploads()
+               if record.get('team_id') == actor['workspace_id']
+               and record.get('access_level', 0) <= ROLES[actor['role']]
+               and (ROLES[actor['role']] >= ROLES['admin'] or record.get('uploaded_by') == actor['id'])]
+    for record in pending:
+        record['display_name'] = record['source_name'].split('__', 1)[-1]
+        record['access_role'] = next(role for role, value in ROLES.items() if value == record.get('access_level', 0))
     return {
         "message": "Success" if pending else "No pending documents",
         "documents": pending,
@@ -218,9 +246,12 @@ def approve_document(document_id: str):
     """
     Approve a pending document and trigger ChromaDB ingestion via Celery.
     """
+    actor = require_role('admin')
     record = get_pending_upload(document_id)
-    if not record:
+    if not record or record.get('team_id') != actor['workspace_id']:
         raise HTTPException(status_code=404, detail=f"Pending document not found: {document_id}")
+    if record.get('access_level', 0) > ROLES[actor['role']]:
+        raise HTTPException(403, 'Document access denied')
     if record.get("status") != "pending_approval":
         raise HTTPException(status_code=400, detail=f"Document is not pending (status={record.get('status')})")
 
@@ -229,8 +260,8 @@ def approve_document(document_id: str):
         raise HTTPException(status_code=404, detail="File not found on disk for this document.")
 
     team_id = record.get("team_id", "default")
-    task = process_document_task.delay(file_path, team_id=team_id)
-    approve_pending_upload(document_id, approved_by="admin", job_id=task.id)
+    task = process_document_task.delay(file_path, team_id=team_id, access_level=record.get('access_level', 0))
+    approve_pending_upload(document_id, approved_by=actor['id'], job_id=task.id)
 
     return {
         "message": "Document approved. Ingestion started in background.",
@@ -242,6 +273,10 @@ def approve_document(document_id: str):
 @app.post("/reject-document/{document_id}")
 def reject_document(document_id: str):
     """Reject a pending document and remove it from the queue."""
+    actor = require_role('admin')
+    record = get_pending_upload(document_id)
+    if not record or record.get('team_id') != actor['workspace_id'] or record.get('access_level', 0) > ROLES[actor['role']]:
+        raise HTTPException(404, 'Pending document not found')
     rejected = reject_pending_upload(document_id)
     if not rejected:
         raise HTTPException(status_code=404, detail=f"Pending document not found: {document_id}")
@@ -252,8 +287,17 @@ def reject_document(document_id: str):
     }
     
 
+def authorize_job(job_id):
+    actor = current()
+    with auth_connect() as db:
+        row = db.execute('SELECT * FROM pending_uploads WHERE job_id=? AND team_id=?', (job_id, actor['workspace_id'])).fetchone()
+    if not row or row['access_level'] > ROLES[actor['role']]:
+        raise HTTPException(404, 'Job not found')
+
+
 @app.get("/job-status/{job_id}")
 async def get_job_status(job_id: str):
+    authorize_job(job_id)
     
     from celery_worker import app as celery_app
     result = AsyncResult(job_id,app=celery_app)
@@ -278,6 +322,7 @@ async def get_job_status(job_id: str):
 
 @app.get("/job-progress/{job_id}")
 async def job_progress_stream(job_id: str):
+    authorize_job(job_id)
     async def event_stream():
         async for event in subscribe(job_id):
             yield f"data: {json.dumps(event)}\n\n"
@@ -294,52 +339,28 @@ async def job_progress_stream(job_id: str):
  
 @app.get("/retriveAllDocuments")
 def getAllDocuments():
-    try:
-        registry_docs = list_documents()
-        if registry_docs:
-            docs = [
-                {
-                    "name": entry.get("source_name"),
-                    "status": entry.get("status", "active"),
-                    "time": entry.get("ingested_at", "N/A"),
-                    "version": entry.get("current_version", 1),
-                    "chunkCount": len(entry.get("chunk_ids") or []),
-                }
-                for entry in registry_docs
-            ]
-            return {
-                "message": "Success" if docs else "No files found",
-                "files": docs,
-            }
+    actor = current()
+    with auth_connect() as db:
+        permitted = {row['source_name']: row['access_level'] for row in db.execute(
+            'SELECT source_name, access_level FROM document_access WHERE workspace_id=? AND access_level<=?',
+            (actor['workspace_id'], ROLES[actor['role']]))}
+    records = [record for record in list_documents() if record['source_name'] in permitted]
+    return {'message': 'Success', 'files': [
+        {'name': record['source_name'], 'displayName': record['source_name'].split('__', 1)[-1],
+         'status': record['status'], 'time': record['ingested_at'], 'version': record['current_version'],
+         'chunkCount': len(record.get('chunk_ids') or []),
+         'accessRole': next(role for role, value in ROLES.items() if value == permitted[record['source_name']])}
+        for record in records]}
 
-        vector_db = engine.get_vector_db(refresh=True)
-        data = vector_db.get()
-        
-        docs = []
-        seen = set()
-        
-        for d in data.get("metadatas",[]):
-            if d.get('source_name') not in seen:
-                docs.append({
-                    "name": d.get('source_name'),
-                    "status": d.get('status', 'unknown'),
-                    "time": d.get('ingested_at', 'N/A'),
-                    "version": d.get('version', 1),
-                    "chunkCount": None,
-                })
-                seen.add(d.get('source_name'))
-
-        return {
-            "message": "Success" if docs else "No files found",
-            "files": docs 
-        }
-                
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
-    
 
 @app.delete("/deleteDocument/{sourceName}")
 def deleteDocument(sourceName: str):
+    actor = require_role('admin')
+    with auth_connect() as db:
+        allowed = db.execute('SELECT 1 FROM document_access WHERE source_name=? AND workspace_id=? AND access_level<=?',
+                             (sourceName.casefold(), actor['workspace_id'], ROLES[actor['role']])).fetchone()
+    if not allowed:
+        raise HTTPException(404, 'Document not found')
     try:
         vector_db = engine.get_vector_db(refresh=True)
         deleted_count = delete_chunks_for_source(vector_db, sourceName)
@@ -364,20 +385,76 @@ def deleteDocument(sourceName: str):
         
 
 
+class DocumentAccessUpdate(BaseModel):
+    access_role: str
+
+
+@app.patch('/documents/{sourceName}/access')
+def update_document_access(sourceName: str, payload: DocumentAccessUpdate):
+    actor = require_role('admin')
+    if payload.access_role not in ROLES or ROLES[payload.access_role] > ROLES[actor['role']]:
+        raise HTTPException(403, 'Cannot assign this access level')
+    with auth_connect() as db:
+        record = db.execute('SELECT * FROM document_access WHERE source_name=? AND workspace_id=?',
+                            (sourceName.casefold(), actor['workspace_id'])).fetchone()
+    if not record or record['access_level'] > ROLES[actor['role']]:
+        raise HTTPException(404, 'Document not found')
+    vector_db = engine.get_vector_db(refresh=True)
+    snapshot = vector_db.get(where={'$and': [{'source_name': sourceName.casefold()}, {'team_id': actor['workspace_id']}]})
+    if not snapshot['ids']:
+        raise HTTPException(409, 'Document has not finished indexing')
+    metadata = [{**item, 'access_level': ROLES[payload.access_role]} for item in snapshot['metadatas']]
+    vector_db._collection.update(ids=snapshot['ids'], metadatas=metadata)
+    with auth_connect() as db:
+        db.execute('UPDATE document_access SET access_level=? WHERE source_name=? AND workspace_id=?',
+                   (ROLES[payload.access_role], sourceName.casefold(), actor['workspace_id']))
+    return {'message': 'Document access updated'}
+
+
+def visible_history(session_id):
+    actor = current()
+    with auth_connect() as db:
+        permitted = {row['source_name'] for row in db.execute(
+            'SELECT source_name FROM document_access WHERE workspace_id=? AND access_level<=?',
+            (actor['workspace_id'], ROLES[actor['role']]))}
+    history = history_manager.get_history(session_id)
+    return [message for message in history if message.get('role') != 'ai' or all(
+        str(source.get('sourceName', '')).casefold() in permitted
+        for source in message.get('sources', []))]
+
+
+def authorize_session(session_id, allow_new=False):
+    if not session_id or len(session_id) > 240:
+        raise HTTPException(422, 'Invalid chat session ID')
+    prefix = f'session_{session_owner()}'
+    if session_id != prefix and not session_id.startswith(prefix + '_'):
+        raise HTTPException(404, 'Chat session not found')
+    with auth_connect() as db:
+        if allow_new:
+            db.execute('INSERT OR IGNORE INTO chat_sessions (session_id, username, title) VALUES (?, ?, ?)',
+                       (session_id, session_owner(), 'New Chat'))
+        existing = db.execute('SELECT username FROM chat_sessions WHERE session_id=?', (session_id,)).fetchone()
+    if existing and existing['username'] != session_owner():
+        raise HTTPException(404, 'Chat session not found')
+    if not existing and not allow_new:
+        raise HTTPException(404, 'Chat session not found')
+
+
 @app.get("/chat-sessions")
 def get_chat_sessions():
     return {
         "message": "Success",
-        "sessions": session_manager.list_sessions("anonymous")
+        "sessions": session_manager.list_sessions(session_owner())
     }
 
 
 @app.post("/chat-sessions")
 def create_chat_session(payload: ChatSessionCreateRequest):
-    session = session_manager.create_session(
-        "anonymous",
+    authorize_session(payload.sessionId, allow_new=True)
+    session = session_manager.update_session(
+        session_owner(),
         payload.sessionId,
-        payload.title or "New Chat",
+        title=payload.title or "New Chat",
     )
     return {
         "message": "Chat session created successfully.",
@@ -387,8 +464,9 @@ def create_chat_session(payload: ChatSessionCreateRequest):
 
 @app.patch("/chat-sessions/{sessionId}")
 def update_chat_session(sessionId: str, payload: ChatSessionUpdateRequest):
+    authorize_session(sessionId)
     session = session_manager.update_session(
-        "anonymous",
+        session_owner(),
         sessionId,
         title=payload.title,
         last_message_at=payload.lastMessageAt,
@@ -433,7 +511,7 @@ def _save_ai_response(session_id: str, answer_text: str, diagrams: list, was_ret
         sources=sources,
     )
     session_manager.update_session(
-        "anonymous",
+        session_owner(),
         session_id,
         last_message_at=now,
         last_message_preview=answer_text or ("Diagram response" if diagrams else "No response was generated."),
@@ -442,9 +520,11 @@ def _save_ai_response(session_id: str, answer_text: str, diagrams: list, was_ret
 
 @app.post("/get-answer")
 def get_answer(question: UserRequest):
-    username = "anonymous"
+    authorize_session(question.sessionId, allow_new=True)
+    question.userTeam = retrieval_scope()
+    username = session_owner()
     session_manager.ensure_session(username, question.sessionId)
-    history = history_manager.get_history(question.sessionId)
+    history = visible_history(question.sessionId)
     result = engine.get_answer(question.question, history, user_team=question.userTeam)
 
     answer_text = result["answer"]
@@ -489,10 +569,12 @@ def get_answer(question: UserRequest):
 
 
 @app.post("/get-answer/stream")
-async def get_answer_stream(question: UserRequest):    # async now
-    username = "anonymous"
+async def get_answer_stream(question: UserRequest):
+    authorize_session(question.sessionId, allow_new=True)
+    question.userTeam = retrieval_scope()
+    username = session_owner()
     session_manager.ensure_session(username, question.sessionId)
-    history = history_manager.get_history(question.sessionId)
+    history = visible_history(question.sessionId)
 
     # Save human message immediately (before streaming begins)
     history_manager.save_messages(question.sessionId, "human", question.question)
@@ -569,7 +651,7 @@ async def get_answer_stream(question: UserRequest):    # async now
                 # Fallback (blocking) in executor if nothing streamed yet
                 fallback = await loop.run_in_executor(
                     None,
-                    lambda: engine.get_answer(question.question, history)
+                    lambda: engine.get_answer(question.question, history, user_team=question.userTeam)
                 )
                 answer_text = fallback.get("answer", "")
                 diagrams = fallback.get("diagrams", [])
@@ -621,7 +703,8 @@ async def get_answer_stream(question: UserRequest):    # async now
      
 @app.post("/get-history/{sessionId}")
 async def getAllChatHistory(sessionId:str):
-    chatHistory = history_manager.get_history(sessionId)
+    authorize_session(sessionId)
+    chatHistory = visible_history(sessionId)
     if len(chatHistory) > 0:
         return {
             "message":"Successfully Retrived Chat History.",
@@ -635,7 +718,8 @@ async def getAllChatHistory(sessionId:str):
     
 @app.post("/delete-chat/{sessionId}")
 async def deleteChatBySessionId(sessionId:str):
-    session_manager.delete_session("anonymous", sessionId)
+    authorize_session(sessionId)
+    session_manager.delete_session(session_owner(), sessionId)
     
     return {
         "message":"Chat Deleted Successfully.."
@@ -647,37 +731,4 @@ async def deleteChatBySessionId(sessionId:str):
 @app.post("/slack/events")
 async def slack_events(request: Request):
     
-    data = await request.json()
-
-    if "challenge" in data:
-        return {"challenge" : data["challenge"]}
-
-
-    event = data.get("event",{})
-    
-    if event.get("type") == "file_shared":
-        file_id = event.get("file_id")
-
-        file_info = requests.get(
-            f"https://slack.com/api/files.info?file={file_id}",
-            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
-        ).json()
-        
-        if file_info.get("ok"):
-            file_data = file_info["file"]
-            file_url = file_data.get("url_private_download") # Use the download URL
-            
-            # Find the channel from the 'shares' object
-            shares = file_data.get("shares", {})
-            public_shares = shares.get("public", {})
-            private_shares = shares.get("private", {})
-            
-            all_shares = {**public_shares, **private_shares}
-            if all_shares:
-                # Pass to Celery
-                process_document_task.delay(
-                    file_url, 
-                    is_slack_upload=True,
-                    slack_token=SLACK_BOT_TOKEN
-                )
-
+    raise HTTPException(403, 'Slack ingestion requires a workspace-bound integration; use authenticated uploads for now.')

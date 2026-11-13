@@ -8,9 +8,8 @@ import {
 } from './utils/ingestProgress.util';
 import ConfirmModal from './components/ui/ConfirmModal';
 
-function App() {
+function App({ user }) {
   const [docs, setDocs] = useState([]);
-  const [user] = useState({ username: 'anonymous', department: 'general' });
   const [deletingDocName, setDeletingDocName] = useState(null);
   const [pendingDeleteName, setPendingDeleteName] = useState(null);
   const [docActionMessage, setDocActionMessage] = useState('');
@@ -41,6 +40,16 @@ function App() {
       console.error('Failed to fetch documents', err);
     }
   }, []);
+
+  const handleAccessChange = async (sourceName, accessRole) => {
+    try {
+      await api.patch(`/documents/${encodeURIComponent(sourceName)}/access`, { access_role: accessRole });
+      setDocActionMessage('Document access updated.');
+      await fetchDocs();
+    } catch (error) {
+      setDocActionMessage(error?.response?.data?.detail || 'Could not update document access.');
+    }
+  };
 
   const handleDeleteDocument = (sourceName) => {
     if (!sourceName || deletingDocName) return;
@@ -83,7 +92,9 @@ function App() {
     setIngestState((prev) => {
       const patch = buildIngestStatePatch(event, prev.fileName);
       const nextStatus =
-        event?.stage === 'completed'
+        event?.stage === 'pending_approval'
+          ? 'pending_approval'
+          : event?.stage === 'completed'
           ? 'completed'
           : event?.stage === 'failed'
             ? 'failed'
@@ -96,6 +107,15 @@ function App() {
       };
     });
   };
+
+  useEffect(() => {
+    const indexed = () => {
+      fetchDocs();
+      setIngestState(INITIAL_INGEST_STATE);
+    };
+    window.addEventListener('document-indexed', indexed);
+    return () => window.removeEventListener('document-indexed', indexed);
+  }, [fetchDocs]);
 
   const handleIngestComplete = async () => {
     await fetchDocs();
@@ -133,6 +153,7 @@ function App() {
         isIngestActive={isIngestActive}
         deletingDocName={deletingDocName}
         onDelete={handleDeleteDocument}
+        onAccessChange={handleAccessChange}
         onRefresh={fetchDocs}
         onIngestStart={handleIngestStart}
         onIngestEvent={handleIngestEvent}

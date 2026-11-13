@@ -34,6 +34,8 @@ export default function ChatHistoryDrawer({
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const [sessions, setSessions] = useState([]);
+  const [accessRole, setAccessRole] = useState('viewer');
+  const canUpload = ['member', 'admin', 'owner'].includes(user?.role);
 
   const username = user?.username ?? null;
 
@@ -114,11 +116,18 @@ export default function ChatHistoryDrawer({
 
     const formData = new FormData();
     formData.append('file', file);
+    formData.append('access_role', accessRole);
 
     onIngestStart?.(file.name);
 
     try {
       const res = await api.post('/upload', formData);
+
+      if (res.data?.status === 'pending_approval') {
+        onIngestEvent?.({ stage: 'pending_approval', message: 'Uploaded. Waiting for an admin to approve it in Pull Requests.', meta: { file_name: file.name } });
+        window.dispatchEvent(new Event('documents-pending'));
+        return;
+      }
 
       const jobId = res.data?.job_id;
       if (jobId) {
@@ -207,7 +216,13 @@ export default function ChatHistoryDrawer({
         Chat History
       </button>
 
-      <label
+      {canUpload && <select aria-label="Document access level" value={accessRole} onChange={(event) => setAccessRole(event.target.value)} className="text-xs rounded-xl px-2" style={{ background: 'var(--dc-surface-1)', color: 'var(--dc-text-primary)' }}>
+        <option value="viewer">Everyone in workspace</option>
+        <option value="member">Members and above</option>
+        {['admin', 'owner'].includes(user.role) && <option value="admin">Admins and owner</option>}
+        {user.role === 'owner' && <option value="owner">Owner only</option>}
+      </select>}
+      {canUpload && <label
         className="inline-flex items-center gap-2 text-xs border rounded-xl px-3 py-2 transition"
         style={isUploading
           ? { color: 'var(--dc-text-muted)', background: 'rgba(124,58,237,0.06)', border: '1px solid rgba(124,58,237,0.25)', cursor: 'not-allowed' }
@@ -230,7 +245,7 @@ export default function ChatHistoryDrawer({
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 16v-7m0 0l-3.5 3.5M12 9l3.5 3.5M19 16V7a2 2 0 00-2-2h-6a2 2 0 00-2 2v5.5" />
         </svg>
         {isUploading ? 'Uploading…' : 'Upload'}
-      </label>
+      </label>}
 
       {isOpen && (
         <div

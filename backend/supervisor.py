@@ -53,7 +53,7 @@ class Supervisor:
         )
         return chunk_ids
         
-    def supervisor(self, file_path: str, job_id: str | None = None, team_id: str = "default"):
+    def supervisor(self, file_path: str, job_id: str | None = None, team_id: str = "default", access_level: int = 0):
         file_name = os.path.basename(file_path).lower()
         vector_db = self.engine.get_vector_db(refresh=True)
         ingested_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -96,6 +96,7 @@ class Supervisor:
                     "ingested_at": ingested_at,
                     "status": "verified",
                     "team_id": team_id,
+                    "access_level": access_level,
                 }]
             )
             
@@ -135,6 +136,8 @@ class Supervisor:
                         "version": version,
                         "ingested_at": ingested_at,
                         "status": "verified",
+                        "team_id": team_id,
+                        "access_level": access_level,
                     })
                     processed_chunks.append(chunk)
 

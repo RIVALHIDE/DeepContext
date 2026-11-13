@@ -5,7 +5,15 @@ const apiBaseUrl =
     `http://${window.location.hostname || "localhost"}:2020`;
 
 const api = axios.create({
-    baseURL: apiBaseUrl
+    baseURL: apiBaseUrl,
+    withCredentials: true,
 })
+
+api.interceptors.response.use((response) => response, (error) => {
+    if (error?.response?.status === 401 && !['/auth/login', '/auth/register', '/auth/accept-invite'].includes(error.config?.url)) {
+        window.dispatchEvent(new Event('auth-expired'));
+    }
+    return Promise.reject(error);
+});
 
 export default api;

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Check, X, FileText, Clock, RefreshCw } from 'lucide-react';
 import api from '../utils/api.util';
+import { waitForIngestProgress } from '../utils/ingestProgress.util';
 
 /**
  * DocumentPullRequest — lists pending uploads awaiting approval.
  * Admins can Approve (triggers ChromaDB ingestion) or Reject.
  */
-export default function DocumentPullRequest() {
+export default function DocumentPullRequest({ user, onComplete }) {
+  const canApprove = ['admin', 'owner'].includes(user?.role);
   const [pendingDocs, setPendingDocs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [actioningId, setActioningId] = useState(null);
@@ -16,7 +18,7 @@ export default function DocumentPullRequest() {
     setLoading(true);
     try {
       const res = await api.get('/pending-documents');
-      setPendingDocs(res.data?.documents ?? []);
+    setPendingDocs(res.data?.documents ?? []);
     } catch (err) {
       console.error('Failed to fetch pending documents', err);
     } finally {
@@ -26,6 +28,8 @@ export default function DocumentPullRequest() {
 
   useEffect(() => {
     fetchPending();
+    window.addEventListener('documents-pending', fetchPending);
+    return () => window.removeEventListener('documents-pending', fetchPending);
   }, [fetchPending]);
 
   const handleApprove = async (documentId) => {
@@ -38,6 +42,17 @@ export default function DocumentPullRequest() {
         message: res.data?.message || 'Document approved. Ingestion started.',
       });
       await fetchPending();
+      if (res.data?.job_id) {
+        const progress = await waitForIngestProgress(res.data.job_id, {
+          onEvent: (event) => setFeedback({ type: event.stage === 'failed' ? 'error' : 'success', message: event.message || 'Processing document…' }),
+        });
+        if (progress.ok) {
+          await onComplete?.();
+          window.dispatchEvent(new Event('document-indexed'));
+        } else if (progress.fallback) {
+          setFeedback({ type: 'success', message: 'Ingestion is running. Refresh the knowledge base when processing finishes.' });
+        }
+      }
     } catch (err) {
       setFeedback({
         type: 'error',
@@ -160,7 +175,7 @@ export default function DocumentPullRequest() {
                     className="text-xs font-medium truncate"
                     style={{ color: 'var(--dc-text-primary)' }}
                   >
-                    {doc.source_name}
+                    {doc.display_name || doc.source_name}
                   </p>
                   <div
                     className="flex items-center gap-2 mt-0.5"
@@ -178,7 +193,8 @@ export default function DocumentPullRequest() {
                 </div>
               </div>
 
-              <div className="flex gap-1.5">
+              <p className="text-[10px]" style={{ color: 'var(--dc-text-muted)' }}>Access: {doc.access_role || 'viewer'} and above</p>
+              {canApprove ? <div className="flex gap-1.5">
                 <button
                   onClick={() => handleApprove(doc.document_id)}
                   disabled={actioningId === doc.document_id}
@@ -221,7 +237,7 @@ export default function DocumentPullRequest() {
                   <X size={12} />
                   Reject
                 </button>
-              </div>
+              </div> : <p className="text-[11px]" style={{ color: 'var(--dc-text-muted)' }}>Waiting for an admin to approve</p>}
             </div>
           ))
         )}

@@ -87,7 +87,7 @@ export function buildIngestStatePatch(event, fileName) {
 
 export function subscribeIngestProgress(jobId, { onEvent, onError, onComplete } = {}) {
   const url = `${apiBaseUrl}/job-progress/${encodeURIComponent(jobId)}`;
-  const source = new EventSource(url);
+  const source = new EventSource(url, { withCredentials: true });
 
   source.onmessage = (e) => {
     try {

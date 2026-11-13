@@ -10,6 +10,7 @@ from chromadb.config import System
 from chromadb.telemetry.product import ProductTelemetryClient, ProductTelemetryEvent
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
+from access_policy import retrieval_filter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.prompts import MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
@@ -507,7 +508,7 @@ class DeepContextEngine:
         distance_max = settings["semantic_distance_max"]
 
         # RBAC filter: only restrict when a non-default team is specified
-        chroma_filter = {"team_id": team_id} if team_id and team_id != "default" else None
+        chroma_filter = retrieval_filter(team_id)
 
         semantic_results = self.vector_db.similarity_search_with_score(
             query, k=semantic_k, filter=chroma_filter
@@ -583,7 +584,7 @@ class DeepContextEngine:
         if not ranked_docs:
             return [], set()
 
-        chroma_filter = {"team_id": team_id} if team_id and team_id != "default" else None
+        chroma_filter = retrieval_filter(team_id)
         all_dept_data = (
             self.vector_db.get(where=chroma_filter) if chroma_filter
             else self.vector_db.get()
@@ -766,7 +767,7 @@ class DeepContextEngine:
         if not source_names:
             return []
 
-        chroma_filter = {"team_id": team_id} if team_id and team_id != "default" else None
+        chroma_filter = retrieval_filter(team_id)
         snapshot = (
             vector_db.get(where=chroma_filter) if chroma_filter
             else vector_db.get()
@@ -878,7 +879,7 @@ class DeepContextEngine:
         # Step 1: Reload Chroma to pick up freshly ingested docs
         vector_db = self.get_vector_db(refresh=True)
 
-        visible_snapshot = vector_db.get()
+        visible_snapshot = vector_db.get(where=retrieval_filter(team_id))
         visible_count = len(visible_snapshot.get("documents", []))
         visible_sources = sorted({
             metadata.get("source_name")

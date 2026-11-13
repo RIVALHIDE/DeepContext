@@ -1,6 +1,6 @@
 import { Trash2, Loader2 } from 'lucide-react';
 
-export default function DocCard({ doc, onDelete, isDeleting }) {
+export default function DocCard({ doc, onDelete, isDeleting, onAccessChange, userRole }) {
   const statusColor = doc.status === 'active' ? 'var(--dc-green)' : 'var(--dc-amber)';
 
   return (
@@ -12,7 +12,7 @@ export default function DocCard({ doc, onDelete, isDeleting }) {
     >
       <div className="flex items-center gap-2 mb-1">
         <span className="text-xs font-medium truncate flex-1" style={{ color: 'var(--dc-text-primary)' }}>
-          {doc.name}
+          {doc.displayName || doc.name}
         </span>
         {doc.version && (
           <span
@@ -22,7 +22,7 @@ export default function DocCard({ doc, onDelete, isDeleting }) {
             v{doc.version}
           </span>
         )}
-        <button
+        {onDelete && <button
           onClick={() => onDelete(doc.name)}
           disabled={isDeleting}
           className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
@@ -32,7 +32,7 @@ export default function DocCard({ doc, onDelete, isDeleting }) {
           aria-label={`Delete ${doc.name}`}
         >
           {isDeleting ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
-        </button>
+        </button>}
       </div>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-1.5">
@@ -43,6 +43,12 @@ export default function DocCard({ doc, onDelete, isDeleting }) {
           {doc.time ? String(doc.time).split(' ')[0] : '—'}
         </span>
       </div>
+      {onAccessChange && <select aria-label={`Access for ${doc.displayName || doc.name}`} value={doc.accessRole || 'viewer'} onChange={(event) => onAccessChange(doc.name, event.target.value)} className="w-full text-[10px] mt-2 rounded p-1" style={{ background: 'var(--dc-bg)', color: 'var(--dc-text-secondary)' }}>
+        <option value="viewer">Everyone in workspace</option>
+        <option value="member">Members and above</option>
+        <option value="admin">Admins and owner</option>
+        {userRole === 'owner' && <option value="owner">Owner only</option>}
+      </select>}
     </div>
   );
 }

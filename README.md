@@ -2,6 +2,57 @@
 
 DeepContext is a document-grounded AI assistant for internal knowledge search. It ingests files into a shared Chroma collection, answers questions with hybrid retrieval, supports diagram-aware responses, and keeps chat sessions/history in SQLite.
 
+## Accounts, workspaces, and access
+
+On first opening the app, create an account and workspace. Its creator becomes the owner. Existing users can sign in; invited users join through the link generated under **Workspace settings**. Invitation links are tied to an email address, expire after seven days, and can be used once. Share links yourself; the app does not send invitation emails.
+
+| Role | Permissions |
+| --- | --- |
+| Viewer | Chat and read documents permitted for viewers |
+| Member | Viewer permissions plus uploads |
+| Admin | Member permissions plus document approval, deletion, access changes, and invitations for viewers/members |
+| Owner | All permissions plus admin invitations, member role changes, and access revocation |
+
+Choose a minimum role when uploading a document. For example, **Admins and owner** excludes viewers and members from document listings, retrieval, diagrams, and job progress. Admins and owners can change access later using the document card selector. Workspace membership is checked on every authenticated request, so role changes apply to existing sessions and revoking access invalidates workspace sessions. Chats are private to a user, workspace, and role; changing role starts a separate history to avoid exposing previously privileged answers.
+
+Authentication uses signed HS256 JWTs with an eight-hour expiry in an HttpOnly, SameSite=Lax cookie. JWT sessions are tracked server-side so logout revokes the token. Passwords use salted scrypt hashes. Browser requests include credentials; API callers may supply the same JWT as `Authorization: Bearer <token>`. Requests from unrelated browser origins are rejected. Login attempts are limited per client/email.
+
+Install the new dependency before restarting API and Celery:
+
+```bash
+cd backend
+source .venv/bin/activate
+uv pip install PyJWT==2.10.1
+```
+
+Optional backend settings:
+
+```env
+# Set a strong shared secret for deployed installations (at least 32 characters).
+# If unset locally, a random secret is stored in backend/data/.jwt-secret.
+JWT_SECRET=replace_with_a_random_secret_at_least_32_characters_long
+# Enable when the app is served over HTTPS.
+AUTH_COOKIE_SECURE=false
+# Optional comma-separated explicit frontend origins for a different host.
+AUTH_ALLOWED_ORIGINS=
+```
+
+Keep API and frontend on the same browser hostname (both localhost or both the same LAN IP). The default frontend configuration chooses that hostname automatically. For deployment, use HTTPS and `AUTH_COOKIE_SECURE=true`; preserve the SQLite database and signing secret across restarts.
+
+Existing anonymous documents and conversations are retained on disk but are not automatically assigned to a workspace. Re-upload and approve the documents you want in a workspace. The old public Slack webhook is disabled until a workspace-bound integration is configured. The Nexconn webhook now requires an authenticated session or bearer JWT and uses that session's workspace/role rather than trusting the payload's team ID.
+
+To enable Nexconn reply delivery, set `NEXCONN_WORKSPACE_ID` to the intended workspace ID (returned by `/auth/me`) alongside the Nexconn API URL/token. Only authenticated admins/owners in that workspace can trigger external reply delivery; it is disabled when no workspace binding is set.
+
+Main authentication endpoints: `POST /auth/register`, `/auth/login`, `/auth/logout`, `/auth/workspaces`, `/auth/switch-workspace`, `/auth/invitations`, `/auth/accept-invite`; `GET /auth/me`, `/auth/members`; `PATCH`/`DELETE /auth/members/{user_id}`. Document access is updated with `PATCH /documents/{sourceName}/access` and `{ "access_role": "viewer|member|admin|owner" }`.
+
+Run backend checks without external services:
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m unittest discover -s tests -v
+```
+
 ## What This App Does
 
 - Uploads business documents and processes them asynchronously
@@ -10,7 +61,7 @@ DeepContext is a document-grounded AI assistant for internal knowledge search. I
 - Answers questions with retrieval + LLM generation
 - Renders markdown answers with citations and diagrams in a React UI
 - Supports chat sessions, history, and document management
-- Accepts Slack file-share events for background ingestion
+- Includes a legacy Slack ingestion path, disabled until workspace-bound integration is configured
 - Uses a tokenized design system and custom brand components in the frontend
 - Holds browser uploads for approval before indexing
 - Supports Nexconn message webhooks
@@ -446,7 +497,7 @@ When a filename includes `meeting` or `transcript`, ingestion follows a dedicate
 
 ## Current Limitations
 
-- Shared knowledge base (no user-level data isolation)
+- Workspace access uses roles and minimum document roles; custom per-person document allowlists are not implemented
 - SQLite is suitable for local/lightweight usage, not high concurrency production
 - PlantUML rendering depends on external PlantUML image hosting
 - Upload validation and operational hardening can be improved

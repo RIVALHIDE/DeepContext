@@ -13,12 +13,14 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 
 from rag_engine import DeepContextEngine
+from auth import retrieval_scope, current, require_role
 
 router = APIRouter()
 
 # ── Nexconn API configuration ────────────────────────────────────────────────
 NEXCONN_API_BASE_URL = os.getenv("NEXCONN_API_BASE_URL", "")
 NEXCONN_API_TOKEN = os.getenv("NEXCONN_API_TOKEN", "")
+NEXCONN_WORKSPACE_ID = os.getenv("NEXCONN_WORKSPACE_ID", "")
 
 
 class NexconnWebhookPayload(BaseModel):
@@ -108,7 +110,7 @@ async def nexconn_webhook(request: Request):
         raise HTTPException(status_code=503, detail="RAG engine not initialized")
     result = _engine.run_workflow(
         payload.message,
-        user_team=payload.team_id,
+        user_team=retrieval_scope(),
         chat_history=[],  # Webhook messages are stateless for now
     )
 
@@ -116,7 +118,10 @@ async def nexconn_webhook(request: Request):
     diagrams = result.get("diagrams", [])
 
     # Push the answer back to the Nexconn channel
-    await _push_to_nexconn(payload.channel_id, answer, diagrams)
+    # A global API credential must never be usable by an unrelated workspace.
+    if NEXCONN_WORKSPACE_ID == current()['workspace_id']:
+        require_role('admin')
+        await _push_to_nexconn(payload.channel_id, answer, diagrams)
 
     return {
         "status": "ok",
