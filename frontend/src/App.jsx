@@ -13,6 +13,7 @@ function App({ user }) {
   const [deletingDocName, setDeletingDocName] = useState(null);
   const [pendingDeleteName, setPendingDeleteName] = useState(null);
   const [docActionMessage, setDocActionMessage] = useState('');
+  const [isRefreshingDocs, setIsRefreshingDocs] = useState(false);
   const [ingestState, setIngestState] = useState(INITIAL_INGEST_STATE);
   const dismissTimerRef = useRef(null);
 
@@ -32,14 +33,29 @@ function App({ user }) {
 
   useEffect(() => () => clearDismissTimer(), []);
 
-  const fetchDocs = useCallback(async () => {
+  const fetchDocs = useCallback(async ({ announce = false } = {}) => {
+    setIsRefreshingDocs(true);
     try {
-      const res = await api.get('/retriveAllDocuments');
-      setDocs(res.data.files);
+      const res = await api.get('/retriveAllDocuments', {
+        params: { refresh: Date.now() },
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+      const nextDocs = res.data?.files ?? [];
+      setDocs(nextDocs);
+      if (announce) {
+        setDocActionMessage(`Knowledge base refreshed · ${nextDocs.length} ${nextDocs.length === 1 ? 'document' : 'documents'}.`);
+      }
+      return nextDocs;
     } catch (err) {
       console.error('Failed to fetch documents', err);
+      setDocActionMessage(err?.response?.data?.detail || 'Refresh failed. Check that the API is running and try again.');
+      return null;
+    } finally {
+      setIsRefreshingDocs(false);
     }
   }, []);
+
+  const handleManualRefresh = useCallback(() => fetchDocs({ announce: true }), [fetchDocs]);
 
   const handleAccessChange = async (sourceName, accessRole) => {
     try {
@@ -120,7 +136,7 @@ function App({ user }) {
   const handleIngestComplete = async () => {
     await fetchDocs();
     setDocActionMessage('');
-    scheduleDismiss(3500);
+    scheduleDismiss(1800);
   };
 
   const handleIngestFailed = (event) => {
@@ -152,9 +168,10 @@ function App({ user }) {
         ingestState={ingestState}
         isIngestActive={isIngestActive}
         deletingDocName={deletingDocName}
+        isRefreshingDocs={isRefreshingDocs}
         onDelete={handleDeleteDocument}
         onAccessChange={handleAccessChange}
-        onRefresh={fetchDocs}
+        onRefresh={handleManualRefresh}
         onIngestStart={handleIngestStart}
         onIngestEvent={handleIngestEvent}
         onIngestComplete={handleIngestComplete}

@@ -53,7 +53,7 @@ class Supervisor:
         )
         return chunk_ids
         
-    def supervisor(self, file_path: str, job_id: str | None = None, team_id: str = "default", access_level: int = 0):
+    def supervisor(self, file_path: str, job_id: str | None = None, team_id: str = "default", access_level: float = 0):
         file_name = os.path.basename(file_path).lower()
         vector_db = self.engine.get_vector_db(refresh=True)
         ingested_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

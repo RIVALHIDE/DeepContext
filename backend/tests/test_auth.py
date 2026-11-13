@@ -90,6 +90,17 @@ class AuthenticationTests(unittest.TestCase):
         self.assertEqual(viewer.post('/auth/invitations', json={'email': 'x@example.com', 'role': 'admin'}).status_code, 403)
         self.assertEqual(viewer.post('/auth/accept-invite', json={'token': token, 'email': 'viewer@example.com', 'name': 'Viewer', 'password': 'viewer-password-123'}).status_code, 400)
 
+    def test_editor_role_can_upload_but_cannot_manage_members(self):
+        self.register(self.owner)
+        editor, _ = self.invite('editor', 'editor@example.com')
+        self.assertEqual(editor.get('/auth/me').json()['user']['role'], 'editor')
+        self.assertEqual(editor.post('/upload-test').status_code, 200)
+        self.assertEqual(editor.get('/auth/members').status_code, 403)
+        self.assertEqual(editor.post('/auth/invitations', json={
+            'email': 'another@example.com',
+            'role': 'viewer',
+        }).status_code, 403)
+
     def test_wrong_email_cannot_redeem_invitation(self):
         self.register(self.owner)
         token = self.owner.post('/auth/invitations', json={'email': 'expected@example.com'}).json()['invite_token']

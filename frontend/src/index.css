@@ -6,6 +6,48 @@
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
+html, body, #root {
+  min-height: 100%;
+  margin: 0;
+  background: var(--dc-bg);
+  color: var(--dc-text-primary);
+}
+
+button, input, textarea, select {
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--dc-brand);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+::selection {
+  background: rgba(37, 99, 235, 0.18);
+  color: var(--dc-text-primary);
+}
+
+.dc-workspace-grid {
+  width: 100%;
+  min-width: 1100px;
+}
+
+@media (max-width: 1280px) {
+  .dc-workspace-grid {
+    grid-template-columns: 220px minmax(500px, 1fr) 350px !important;
+    gap: 9px !important;
+    padding: 9px !important;
+  }
+}
+
 code, pre, kbd {
   font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
 }
@@ -88,9 +130,9 @@ code, pre, kbd {
   font-size: 0.82em;
   padding: 0.15em 0.45em;
   border-radius: 5px;
-  background: rgba(0, 201, 177, 0.1);
+  background: rgba(37, 99, 235, 0.08);
   color: var(--dc-brand-glow);
-  border: 1px solid rgba(0, 201, 177, 0.2);
+  border: 1px solid rgba(37, 99, 235, 0.18);
 }
 
 .markdown-content pre {

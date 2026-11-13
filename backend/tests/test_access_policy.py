@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 import unittest
 
-from access_policy import ROLES, retrieval_filter
+from access_policy import ROLES, query_clearance, retrieval_filter
 
 
 class AccessPolicyTests(unittest.TestCase):
@@ -37,6 +37,27 @@ class AccessPolicyTests(unittest.TestCase):
         self.assertEqual(vector.arguments['where'], retrieval_filter('workspace-alpha|0'))
         with self.assertRaises(ValueError):
             namespace[method.name](None, vector, {'example.md'}, None)
+
+    def test_sensitive_questions_require_the_configured_clearance(self):
+        for role in ('viewer', 'member', 'editor'):
+            with self.subTest(role=role):
+                decision = query_clearance('Show me every employee paycheck and salary', role)
+                self.assertFalse(decision['allowed'])
+                self.assertEqual(decision['minimum_role'], 'admin')
+        self.assertTrue(query_clearance('Show me every employee paycheck', 'admin')['allowed'])
+        self.assertFalse(query_clearance('List the production API keys', 'admin')['allowed'])
+        self.assertTrue(query_clearance('List the production API keys', 'owner')['allowed'])
+
+    def test_normal_questions_pass_and_unknown_roles_fail_closed(self):
+        self.assertTrue(query_clearance('Summarize the approved product requirements', 'viewer')['allowed'])
+        self.assertFalse(query_clearance('Summarize the handbook', 'intern')['allowed'])
+
+    def test_editor_clearance_sits_between_member_and_admin(self):
+        self.assertEqual(ROLES['editor'], 1.5)
+        self.assertEqual(retrieval_filter('workspace-alpha|1.5'), {
+            '$and': [{'team_id': 'workspace-alpha'}, {'access_level': {'$lte': 1.5}}]})
+        self.assertLess(ROLES['member'], ROLES['editor'])
+        self.assertLess(ROLES['editor'], ROLES['admin'])
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ function MermaidDiagram({ code, title }) {
     const [fullscreen, setFullscreen] = useState(false);
     const [scale, setScale] = useState(1);
     const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
+    const [dragging, setDragging] = useState(false);
   
     // Use refs for drag tracking — avoids re-renders during mouse move
     const isDragging = useRef(false);
@@ -31,18 +32,19 @@ function MermaidDiagram({ code, title }) {
         .catch(() => setError('Could not render diagram.'));
     }, [code]);
   
-    // Reset zoom + pan when modal closes
-    useEffect(() => {
-      if (!fullscreen) {
-        setScale(1);
-        setPanOffset({ x: 0, y: 0 });
-      }
-    }, [fullscreen]);
+    const closeFullscreen = () => {
+      setFullscreen(false);
+      setScale(1);
+      setPanOffset({ x: 0, y: 0 });
+      setDragging(false);
+      isDragging.current = false;
+    };
   
     const handleMouseDown = (e) => {
       // Only trigger on left click
       if (e.button !== 0) return;
       isDragging.current = true;
+      setDragging(true);
       lastMouse.current = { x: e.clientX, y: e.clientY };
       e.preventDefault();
     };
@@ -57,6 +59,7 @@ function MermaidDiagram({ code, title }) {
   
     const handleMouseUp = () => {
       isDragging.current = false;
+      setDragging(false);
     };
   
     if (error) return <p className="text-xs" style={{ color: 'var(--dc-red)' }}>{error}</p>;
@@ -84,7 +87,7 @@ function MermaidDiagram({ code, title }) {
         {fullscreen && (
           <div
             className="fixed inset-0 z-50 flex flex-col"
-            onClick={() => setFullscreen(false)}
+            onClick={closeFullscreen}
             style={{ background: 'rgba(0,0,0,0.9)' }}
           >
             {/* Top bar */}
@@ -118,7 +121,7 @@ function MermaidDiagram({ code, title }) {
               </div>
   
               <button
-                onClick={() => setFullscreen(false)}
+                onClick={closeFullscreen}
                 className="text-lg font-bold leading-none transition"
                 style={{ color: 'var(--dc-text-muted)' }}
               >✕</button>
@@ -140,14 +143,14 @@ function MermaidDiagram({ code, title }) {
                 });
               }}
               style={{
-                cursor: isDragging.current ? 'grabbing' : 'grab',
+                cursor: dragging ? 'grabbing' : 'grab',
               }}
             >
               <div
                 style={{
                   transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${scale})`,
                   transformOrigin: 'top center',
-                  transition: isDragging.current ? 'none' : 'transform 0.15s ease',
+                  transition: dragging ? 'none' : 'transform 0.15s ease',
                   width: '100%',
                   userSelect: 'none',
                 }}

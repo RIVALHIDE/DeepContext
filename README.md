@@ -10,10 +10,13 @@ On first opening the app, create an account and workspace. Its creator becomes t
 | --- | --- |
 | Viewer | Chat and read documents permitted for viewers |
 | Member | Viewer permissions plus uploads |
-| Admin | Member permissions plus document approval, deletion, access changes, and invitations for viewers/members |
+| Editor | Member permissions plus document approval, deletion, and access changes |
+| Admin | Editor permissions plus invitations for viewers, members, and editors |
 | Owner | All permissions plus admin invitations, member role changes, and access revocation |
 
-Choose a minimum role when uploading a document. For example, **Admins and owner** excludes viewers and members from document listings, retrieval, diagrams, and job progress. Admins and owners can change access later using the document card selector. Workspace membership is checked on every authenticated request, so role changes apply to existing sessions and revoking access invalidates workspace sessions. Chats are private to a user, workspace, and role; changing role starts a separate history to avoid exposing previously privileged answers.
+The clearance hierarchy is `viewer < member < editor < admin < owner`. A role inherits the document access of every role below it, but management capabilities remain explicit: editors manage documents, admins manage invitations and member visibility, and only owners can change or revoke memberships. Owners cannot be demoted or removed.
+
+Choose a minimum role when uploading a document; the uploader's role is selected by default. For example, **Editors and above** excludes viewers and members from document listings, retrieval, diagrams, and job progress. Editor, admin, and owner uploads are self-approved and start indexing immediately. Member uploads wait for an editor or higher role to approve them. Editors, admins, and owners can change access later using the document card selector. Workspace membership is checked on every authenticated request, so role changes apply to existing sessions and revoking access invalidates workspace sessions. Chats are private to a user, workspace, and role; changing role starts a separate history to avoid exposing previously privileged answers.
 
 Authentication uses signed HS256 JWTs with an eight-hour expiry in an HttpOnly, SameSite=Lax cookie. JWT sessions are tracked server-side so logout revokes the token. Passwords use salted scrypt hashes. Browser requests include credentials; API callers may supply the same JWT as `Authorization: Bearer <token>`. Requests from unrelated browser origins are rejected. Login attempts are limited per client/email.
 
@@ -39,11 +42,20 @@ AUTH_ALLOWED_ORIGINS=
 
 Keep API and frontend on the same browser hostname (both localhost or both the same LAN IP). The default frontend configuration chooses that hostname automatically. For deployment, use HTTPS and `AUTH_COOKIE_SECURE=true`; preserve the SQLite database and signing secret across restarts.
 
-Existing anonymous documents and conversations are retained on disk but are not automatically assigned to a workspace. Re-upload and approve the documents you want in a workspace. The old public Slack webhook is disabled until a workspace-bound integration is configured. The Nexconn webhook now requires an authenticated session or bearer JWT and uses that session's workspace/role rather than trusting the payload's team ID.
+Existing anonymous documents and conversations are retained on disk but are not automatically assigned to a workspace. Re-upload and approve the documents you want in a workspace. The old public Slack webhook is disabled until a workspace-bound integration is configured.
 
-To enable Nexconn reply delivery, set `NEXCONN_WORKSPACE_ID` to the intended workspace ID (returned by `/auth/me`) alongside the Nexconn API URL/token. Only authenticated admins/owners in that workspace can trigger external reply delivery; it is disabled when no workspace binding is set.
+The center panel has two separate modes: **AI assistant** is the document-grounded DeepContext chat, while **Nexconn** is a real Nexconn Chat SDK channel. Nexconn is bound to one DeepContext workspace by `NEXCONN_WORKSPACE_ID`; users in any other workspace receive no Nexconn credentials. The App Secret is used only by the backend to sign Nexconn's access-token request and is never returned to the browser.
 
-Main authentication endpoints: `POST /auth/register`, `/auth/login`, `/auth/logout`, `/auth/workspaces`, `/auth/switch-workspace`, `/auth/invitations`, `/auth/accept-invite`; `GET /auth/me`, `/auth/members`; `PATCH`/`DELETE /auth/members/{user_id}`. Document access is updated with `PATCH /documents/{sourceName}/access` and `{ "access_role": "viewer|member|admin|owner" }`.
+Main authentication endpoints: `POST /auth/register`, `/auth/login`, `/auth/logout`, `/auth/workspaces`, `/auth/switch-workspace`, `/auth/invitations`, `/auth/accept-invite`; `GET /auth/me`, `/auth/members`; `PATCH`/`DELETE /auth/members/{user_id}`. Document access is updated with `PATCH /documents/{sourceName}/access` and `{ "access_role": "viewer|member|editor|admin|owner" }`.
+
+### AI clearance enforcement
+
+AI access is enforced at two independent layers:
+
+1. Every Chroma query includes the authenticated workspace ID and `access_level <= current role`. This applies to semantic retrieval, BM25, sibling expansion, diagrams, and document snapshots, so restricted chunks never enter the model context.
+2. `access_policy.query_clearance` evaluates sensitive intent before retrieval. Compensation and private employee records require `admin`; credentials and secrets require `owner`. Blocked questions return a clean policy response without calling Chroma or the LLM.
+
+`viewer` is the lowest-clearance role in the five-role model and is the intern-equivalent tier. Keep document access at the lowest role that genuinely needs it; the query guardrail is defense in depth and never replaces document metadata permissions. Add or revise sensitive-topic patterns centrally in `backend/access_policy.py`.
 
 Run backend checks without external services:
 
@@ -64,7 +76,7 @@ python -m unittest discover -s tests -v
 - Includes a legacy Slack ingestion path, disabled until workspace-bound integration is configured
 - Uses a tokenized design system and custom brand components in the frontend
 - Holds browser uploads for approval before indexing
-- Supports Nexconn message webhooks
+- Connects authenticated workspace members to a real Nexconn direct, group, open, or community channel
 
 ## Architecture at a Glance
 
@@ -215,7 +227,7 @@ LibreOffice is included in the backend Docker image. Modern `.docx`, `.xlsx`, an
 | `GET` | `/pending-documents` | List uploads awaiting approval |
 | `POST` | `/approve-document/{document_id}` | Approve upload and queue ingestion |
 | `POST` | `/reject-document/{document_id}` | Reject pending upload |
-| `POST` | `/nexconn-webhook` | Answer a Nexconn message |
+| `GET` | `/nexconn/session` | Issue an authenticated Nexconn SDK bootstrap for the active workspace |
 | `GET`    | `/job-progress/{job_id}`       | SSE stream of ingestion job progress      |
 | `GET`    | `/job-status/{job_id}`         | Check ingestion job status                |
 | `GET`    | `/health`                      | API + Chroma health summary               |
@@ -249,9 +261,21 @@ GROQ_MEETING_MODEL=openai/gpt-oss-20b
 # Optional (Slack ingestion)
 SLACK_BOT_TOKEN=your_slack_bot_token
 
-# Optional (Nexconn reply delivery)
-NEXCONN_API_BASE_URL=
-NEXCONN_API_TOKEN=
+# Optional (real Nexconn Chat channel)
+# Use the data-center API base URL shown in the Nexconn Console.
+NEXCONN_API_BASE_URL=https://api.sg-light-api.com
+NEXCONN_APP_KEY=
+NEXCONN_APP_SECRET=
+# Copy the active workspace ID from GET /auth/me.
+NEXCONN_WORKSPACE_ID=
+# direct | group | open | community
+NEXCONN_CHANNEL_TYPE=group
+NEXCONN_CHANNEL_ID=
+# Required only when NEXCONN_CHANNEL_TYPE=community.
+NEXCONN_SUBCHANNEL_ID=
+NEXCONN_CHANNEL_NAME=Nexconn Channel
+# sg | bj | na | sa | om
+NEXCONN_AREA_CODE=sg
 
 # Chroma connection (must match across API + Celery worker)
 CHROMA_HOST=localhost
@@ -280,13 +304,29 @@ REDIS_URL=redis://localhost:6379/0
 HUGGINGFACE_LOCAL_FILES_ONLY=false
 ```
 
+### Enable the Nexconn channel
+
+1. Create a Nexconn application and copy its environment-specific App Key, App Secret, and data-center API base URL into `backend/.env` using the variables above.
+2. Sign in to DeepContext and copy `user.workspace_id` from `GET /auth/me` into `NEXCONN_WORKSPACE_ID`.
+3. Choose a channel type and ID. A group ID must contain only letters and numbers and be at most 64 characters. For a community channel, also provide its subchannel ID.
+4. Restart the FastAPI backend, select **Nexconn** in the center-panel switcher, and connect as the DeepContext workspace owner first.
+
+For a group channel, that first owner connection creates the configured Nexconn group if necessary. Later workspace members are registered with opaque Nexconn user IDs and added to the group automatically. Open and community channels must already exist in Nexconn; direct mode treats `NEXCONN_CHANNEL_ID` as the other user's Nexconn ID. The Nexconn SDK is loaded only when the Nexconn tab is opened, so it does not slow the initial AI-assistant page load.
+
+Nexconn chat is available to every authenticated workspace role because it is a collaboration channel, not a document-retrieval path. The backend binds the session to `NEXCONN_WORKSPACE_ID`, returns no App Secret, and permits only the DeepContext owner to create a missing group. Nexconn messages do not bypass Chroma document clearance or the AI query guardrail.
+
 Frontend base URL:
 
 ```env
 VITE_API_BASE_URL=http://localhost:2020
+# Optional: URL of your deployed Nexconn Call/huddle experience.
+VITE_NEXCONN_HUDDLE_URL=https://your-call-app.example.com/room
 ```
 
 If `VITE_API_BASE_URL` is not set, frontend falls back to `http://<browser-hostname>:2020`.
+The **Huddle** button opens `VITE_NEXCONN_HUDDLE_URL` with the current workspace ID as
+the `workspace` query parameter. When it is not configured, the UI displays setup guidance
+instead of pretending that a call was connected.
 
 ### Chroma environment matrix
 
@@ -339,6 +379,8 @@ Create or edit `frontend/.env`:
 
 ```env
 VITE_API_BASE_URL=http://localhost:2020
+# Optional; opens the configured room from the Huddle button.
+VITE_NEXCONN_HUDDLE_URL=https://your-call-app.example.com/room
 ```
 
 The first API/worker startup downloads Hugging Face embedding models and can take several minutes. Groq credentials and network access are needed for answer generation, vision extraction, and meeting summaries.
@@ -425,7 +467,7 @@ docker compose down
 
 `down` retains named volumes. Uploads and SQLite remain in `backend/data`. The Compose stack also starts MongoDB and a PlantUML server, but the current backend persists metadata in SQLite and generates public PlantUML image URLs; these extra services are not required for the core local workflow.
 
-Optional Nexconn settings in Compose use `${NEXCONN_API_BASE_URL}` and `${NEXCONN_API_TOKEN}` interpolation: set them in your shell or a root `.env` file. The Compose environment entries override values in `backend/.env`.
+Optional Nexconn settings in Compose use `${NEXCONN_*}` interpolation: set them in your shell or a root `.env` file. The Compose environment entries override values in `backend/.env`.
 
 Default access:
 

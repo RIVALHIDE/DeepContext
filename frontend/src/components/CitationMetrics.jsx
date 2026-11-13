@@ -149,7 +149,8 @@ export default function CitationMetrics({ sources = [], tokenUsage = null }) {
           style={{ color: 'var(--dc-text-muted)' }}
         >
           <FileSearch size={18} style={{ opacity: 0.4 }} />
-          <p className="text-[10px]">No citations yet</p>
+          <p className="text-[11px] font-medium" style={{ color: 'var(--dc-text-secondary)' }}>No citations yet</p>
+          <p className="text-[10px] max-w-[220px] text-center leading-relaxed">Ask a question to see the source documents used in the answer.</p>
         </div>
       )}
     </div>

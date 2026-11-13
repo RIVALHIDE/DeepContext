@@ -5,6 +5,7 @@ import shutil
 import requests
 import asyncio
 import uuid
+import re
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
@@ -19,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from auth import (install_auth, current, require_role, session_owner, retrieval_scope, retrieval_filter,
                   connect as auth_connect, ROLES)
 from office_loader import OFFICE_EXTENSIONS
+from access_policy import query_clearance
 from pydantic import BaseModel
 
 from ingest_progress import get_latest, subscribe
@@ -35,7 +37,7 @@ from document_registry import (
     reject_pending_upload,
 )
 from rag_engine import DeepContextEngine, _normalize_markdown_answer
-from webhook import router as webhook_router, set_engine as set_webhook_engine
+from webhook import router as nexconn_router
 
 
 SLACK_BOT_TOKEN=os.getenv("SLACK_BOT_TOKEN")
@@ -84,10 +86,9 @@ app.add_middleware(
 
 
 # ── Nexconn webhook router ─────────────────────────────────────────────────
-app.include_router(webhook_router)
+app.include_router(nexconn_router)
 
 engine = DeepContextEngine()
-set_webhook_engine(engine)  # Share the engine with the webhook router
 supervisor = supervisor.Supervisor()
 history_manager = ChatHistroyManager()
 session_manager = ChatSessionManager()
@@ -155,16 +156,17 @@ def chroma_health_check():
     return check_chroma_health()
 
 @app.post("/upload")
-async def upload_docs(file: UploadFile = File(...), access_role: str = Form("viewer")):
+async def upload_docs(file: UploadFile = File(...), access_role: str = Form("")):
     """
     Hardened upload endpoint.
 
     Validates file size (15 MB max) and MIME type, saves the file to disk,
-    and registers it in the pending_uploads table with status 'pending_approval'.
-    ChromaDB ingestion is deferred until an admin approves the document.
+    and registers it in the upload audit table. Member uploads wait for approval;
+    editor, admin, and owner uploads start ingestion immediately.
     """
 
     actor = require_role('member')
+    access_role = access_role or actor['role']
     if access_role not in ROLES or ROLES[access_role] > ROLES[actor['role']]:
         raise HTTPException(403, 'You cannot grant document access above your own role')
     # ── File size validation ──
@@ -200,7 +202,7 @@ async def upload_docs(file: UploadFile = File(...), access_role: str = Form("vie
     with open(file_path, "wb") as buffer:
         buffer.write(content)
 
-    # ── Register as pending approval ──
+    # ── Register the upload before either approval or immediate ingestion ──
     document_id = str(uuid.uuid4())
     create_pending_upload(
         document_id=document_id,
@@ -215,12 +217,30 @@ async def upload_docs(file: UploadFile = File(...), access_role: str = Form("vie
     with auth_connect() as db:
         db.execute('UPDATE pending_uploads SET access_level=? WHERE document_id=?', (ROLES[access_role], document_id))
 
+    if ROLES[actor['role']] >= ROLES['editor']:
+        task = process_document_task.delay(
+            file_path,
+            team_id=actor['workspace_id'],
+            access_level=ROLES[access_role],
+        )
+        approve_pending_upload(document_id, approved_by=actor['id'], job_id=task.id)
+        return {
+            "message": "Upload successful. Ingestion started.",
+            "document_id": document_id,
+            "job_id": task.id,
+            "status": "processing",
+            "file_name": file.filename,
+            "file_size": file_size,
+            "access_role": access_role,
+        }
+
     return {
         "message": "Upload successful. Document is pending approval before ingestion.",
         "document_id": document_id,
         "status": "pending_approval",
         "file_name": file.filename,
         "file_size": file_size,
+        "access_role": access_role,
     }
 
 
@@ -231,7 +251,7 @@ def get_pending_documents():
     pending = [record for record in list_pending_uploads()
                if record.get('team_id') == actor['workspace_id']
                and record.get('access_level', 0) <= ROLES[actor['role']]
-               and (ROLES[actor['role']] >= ROLES['admin'] or record.get('uploaded_by') == actor['id'])]
+               and (ROLES[actor['role']] >= ROLES['editor'] or record.get('uploaded_by') == actor['id'])]
     for record in pending:
         record['display_name'] = record['source_name'].split('__', 1)[-1]
         record['access_role'] = next(role for role, value in ROLES.items() if value == record.get('access_level', 0))
@@ -246,7 +266,7 @@ def approve_document(document_id: str):
     """
     Approve a pending document and trigger ChromaDB ingestion via Celery.
     """
-    actor = require_role('admin')
+    actor = require_role('editor')
     record = get_pending_upload(document_id)
     if not record or record.get('team_id') != actor['workspace_id']:
         raise HTTPException(status_code=404, detail=f"Pending document not found: {document_id}")
@@ -273,7 +293,7 @@ def approve_document(document_id: str):
 @app.post("/reject-document/{document_id}")
 def reject_document(document_id: str):
     """Reject a pending document and remove it from the queue."""
-    actor = require_role('admin')
+    actor = require_role('editor')
     record = get_pending_upload(document_id)
     if not record or record.get('team_id') != actor['workspace_id'] or record.get('access_level', 0) > ROLES[actor['role']]:
         raise HTTPException(404, 'Pending document not found')
@@ -355,7 +375,7 @@ def getAllDocuments():
 
 @app.delete("/deleteDocument/{sourceName}")
 def deleteDocument(sourceName: str):
-    actor = require_role('admin')
+    actor = require_role('editor')
     with auth_connect() as db:
         allowed = db.execute('SELECT 1 FROM document_access WHERE source_name=? AND workspace_id=? AND access_level<=?',
                              (sourceName.casefold(), actor['workspace_id'], ROLES[actor['role']])).fetchone()
@@ -391,7 +411,7 @@ class DocumentAccessUpdate(BaseModel):
 
 @app.patch('/documents/{sourceName}/access')
 def update_document_access(sourceName: str, payload: DocumentAccessUpdate):
-    actor = require_role('admin')
+    actor = require_role('editor')
     if payload.access_role not in ROLES or ROLES[payload.access_role] > ROLES[actor['role']]:
         raise HTTPException(403, 'Cannot assign this access level')
     with auth_connect() as db:
@@ -522,9 +542,32 @@ def _save_ai_response(session_id: str, answer_text: str, diagrams: list, was_ret
 def get_answer(question: UserRequest):
     authorize_session(question.sessionId, allow_new=True)
     question.userTeam = retrieval_scope()
+    actor = current()
     username = session_owner()
     session_manager.ensure_session(username, question.sessionId)
     history = visible_history(question.sessionId)
+    clearance = query_clearance(question.question, actor['role'])
+    if not clearance['allowed']:
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        history_manager.save_messages(question.sessionId, "human", question.question)
+        session_manager.update_session(
+            username, question.sessionId,
+            last_message_at=now,
+            last_message_preview=question.question,
+        )
+        _save_ai_response(question.sessionId, clearance['message'], [], False, sources=[])
+        return {
+            "answer": clearance['message'],
+            "diagrams": [],
+            "sources": [],
+            "citation_names": [],
+            "blocked": True,
+            "guardrail": {
+                "category": clearance['category'],
+                "minimum_role": clearance['minimum_role'],
+                "current_role": actor['role'],
+            },
+        }
     result = engine.get_answer(question.question, history, user_team=question.userTeam)
 
     answer_text = result["answer"]
@@ -572,9 +615,11 @@ def get_answer(question: UserRequest):
 async def get_answer_stream(question: UserRequest):
     authorize_session(question.sessionId, allow_new=True)
     question.userTeam = retrieval_scope()
+    actor = current()
     username = session_owner()
     session_manager.ensure_session(username, question.sessionId)
     history = visible_history(question.sessionId)
+    clearance = query_clearance(question.question, actor['role'])
 
     # Save human message immediately (before streaming begins)
     history_manager.save_messages(question.sessionId, "human", question.question)
@@ -584,9 +629,44 @@ async def get_answer_stream(question: UserRequest):
         last_message_preview=question.question,
     )
 
+    if not clearance['allowed']:
+        answer_text = clearance['message']
+        _save_ai_response(question.sessionId, answer_text, [], False, sources=[])
+
+        async def blocked_event_stream():
+            yield _build_sse_event("guardrail", {
+                "blocked": True,
+                "category": clearance['category'],
+                "minimum_role": clearance['minimum_role'],
+                "current_role": actor['role'],
+            })
+            for token in re.findall(r"\S+\s*|\s+", answer_text):
+                yield _build_sse_event("token", {"token": token})
+            yield _build_sse_event("done", {
+                "answer": answer_text,
+                "diagrams": [],
+                "sources": [],
+                "citation_names": [],
+                "retrieved": False,
+                "blocked": True,
+                "guardrail": {
+                    "category": clearance['category'],
+                    "minimum_role": clearance['minimum_role'],
+                    "current_role": actor['role'],
+                },
+            })
+
+        return StreamingResponse(
+            blocked_event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     async def event_stream():
-        # Emit thinking immediately so frontend can show spinner
-        yield _build_sse_event("thinking", {"message": "Searching knowledge base…"})
+        yield _build_sse_event("thinking", {
+            "stage": "retrieving",
+            "message": "Retrieving permitted documents…",
+        })
 
         # Run blocking preparation (retrieval / chain build) in executor
         loop = asyncio.get_event_loop()
@@ -632,7 +712,11 @@ async def get_answer_stream(question: UserRequest):
         context_block = prepared["context_block"]
         diagrams = prepared.get("diagrams", [])
         answer_parts = []
-        received_token = False
+
+        yield _build_sse_event("thinking", {
+            "stage": "drafting",
+            "message": "Drafting a grounded response…",
+        })
 
         try:
             async for chunk in question_answer_chain.astream({
@@ -642,32 +726,63 @@ async def get_answer_stream(question: UserRequest):
                 token = chunk.content if hasattr(chunk, "content") else str(chunk or "")
                 if not token:
                     continue
-                received_token = True
                 answer_parts.append(token)
-                yield _build_sse_event("token", {"token": token})
 
         except Exception as stream_exc:
-            if not received_token:
-                # Fallback (blocking) in executor if nothing streamed yet
-                fallback = await loop.run_in_executor(
-                    None,
-                    lambda: engine.get_answer(question.question, history, user_team=question.userTeam)
-                )
-                answer_text = fallback.get("answer", "")
-                diagrams = fallback.get("diagrams", [])
-                sources = fallback.get("sources", [])
-                _save_ai_response(question.sessionId, answer_text, diagrams, True, sources=sources)
-                yield _build_sse_event("done", {
-                    "answer": answer_text, "diagrams": diagrams,
-                    "sources": sources,
-                    "retrieved": True, "fallback": True,
-                })
-                return
-            raise stream_exc
+            print(f"Streaming draft failed; using reflected workflow: {stream_exc}")
+            yield _build_sse_event("thinking", {
+                "stage": "verifying",
+                "message": "Agent verifying facts…",
+            })
+            fallback = await loop.run_in_executor(
+                None,
+                lambda: engine.get_answer(question.question, history, user_team=question.userTeam)
+            )
+            answer_text = fallback.get("answer", "")
+            diagrams = fallback.get("diagrams", [])
+            sources = fallback.get("sources", [])
+            _save_ai_response(question.sessionId, answer_text, diagrams, True, sources=sources)
+            for token in re.findall(r"\S+\s*|\s+", answer_text):
+                yield _build_sse_event("token", {"token": token})
+            yield _build_sse_event("done", {
+                "answer": answer_text, "diagrams": diagrams,
+                "sources": sources,
+                "retrieved": True, "fallback": True,
+            })
+            return
 
         answer_text = _normalize_markdown_answer("".join(answer_parts))
         sources = prepared.get("sources", [])
         citation_names = prepared.get("citation_names", [])
+
+        yield _build_sse_event("thinking", {
+            "stage": "verifying",
+            "message": "Agent verifying facts…",
+        })
+        reflection_state = {
+            "draft_answer": answer_text,
+            "context_block": context_block,
+            "retry_count": 0,
+            "reflection_passed": False,
+            "reflection_feedback": "",
+        }
+        reflection_state = await loop.run_in_executor(
+            None,
+            lambda: engine._node_reflect(reflection_state),
+        )
+        if not reflection_state.get("reflection_passed", True):
+            corrected = await loop.run_in_executor(
+                None,
+                lambda: engine.get_answer(question.question, history, user_team=question.userTeam),
+            )
+            answer_text = corrected.get("answer", answer_text)
+            diagrams = corrected.get("diagrams", diagrams)
+            sources = corrected.get("sources", sources)
+            citation_names = corrected.get("citation_names", citation_names)
+
+        for token in re.findall(r"\S+\s*|\s+", answer_text):
+            yield _build_sse_event("token", {"token": token})
+
         if sources and isinstance(sources, list) and len(sources) > 0:
             sources_to_save = sources
         elif citation_names and isinstance(citation_names, list) and len(citation_names) > 0:

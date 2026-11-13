@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Clock, MessageSquarePlus, X } from 'lucide-react';
+import { Clock, ExternalLink, FileCheck2, MessageSquarePlus, ShieldCheck, UploadCloud, Video, X } from 'lucide-react';
 import api from '../utils/api.util';
 import {
   STAGE_LABELS,
@@ -34,8 +34,14 @@ export default function ChatHistoryDrawer({
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const [sessions, setSessions] = useState([]);
-  const [accessRole, setAccessRole] = useState('viewer');
-  const canUpload = ['member', 'admin', 'owner'].includes(user?.role);
+  const [accessRole, setAccessRole] = useState(user?.role || 'viewer');
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [uploadError, setUploadError] = useState('');
+  const [huddleOpen, setHuddleOpen] = useState(false);
+  const canUpload = ['member', 'editor', 'admin', 'owner'].includes(user?.role);
+  const canSelfApprove = ['editor', 'admin', 'owner'].includes(user?.role);
+  const huddleUrl = import.meta.env.VITE_NEXCONN_HUDDLE_URL;
 
   const username = user?.username ?? null;
 
@@ -114,6 +120,18 @@ export default function ChatHistoryDrawer({
   const handleUpload = async (file) => {
     if (!file || isUploading) return;
 
+    const extension = `.${file.name.split('.').pop()?.toLowerCase() || ''}`;
+    const allowed = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.txt', '.md', '.puml', '.mmd', '.mermaid', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx']);
+    if (file.size > 15 * 1024 * 1024) {
+      setUploadError('This file is larger than the 15MB limit.');
+      return;
+    }
+    if (!allowed.has(extension)) {
+      setUploadError('This file type is not supported. Choose a document, image, diagram, or Office file.');
+      return;
+    }
+    setUploadError('');
+
     const formData = new FormData();
     formData.append('file', file);
     formData.append('access_role', accessRole);
@@ -122,9 +140,13 @@ export default function ChatHistoryDrawer({
 
     try {
       const res = await api.post('/upload', formData);
+      // The dialog covers only the browser-to-API transfer. Once accepted,
+      // indexing continues in the background status strip.
+      setUploadOpen(false);
+      setSelectedFile(null);
 
       if (res.data?.status === 'pending_approval') {
-        onIngestEvent?.({ stage: 'pending_approval', message: 'Uploaded. Waiting for an admin to approve it in Pull Requests.', meta: { file_name: file.name } });
+        onIngestEvent?.({ stage: 'pending_approval', message: 'Uploaded. Waiting for an editor or admin to approve it in Pull Requests.', meta: { file_name: file.name } });
         window.dispatchEvent(new Event('documents-pending'));
         return;
       }
@@ -166,6 +188,7 @@ export default function ChatHistoryDrawer({
           ? `Upload failed (HTTP ${err.response.status}). Check the API terminal for details.`
           : `Cannot reach the API at ${api.defaults.baseURL}. Check that the API is running and reachable.`;
       onIngestFailed?.({ message });
+      setUploadError(message);
     }
   };
 
@@ -219,33 +242,72 @@ export default function ChatHistoryDrawer({
       {canUpload && <select aria-label="Document access level" value={accessRole} onChange={(event) => setAccessRole(event.target.value)} className="text-xs rounded-xl px-2" style={{ background: 'var(--dc-surface-1)', color: 'var(--dc-text-primary)' }}>
         <option value="viewer">Everyone in workspace</option>
         <option value="member">Members and above</option>
+        {['editor', 'admin', 'owner'].includes(user.role) && <option value="editor">Editors and above</option>}
         {['admin', 'owner'].includes(user.role) && <option value="admin">Admins and owner</option>}
         {user.role === 'owner' && <option value="owner">Owner only</option>}
       </select>}
-      {canUpload && <label
-        className="inline-flex items-center gap-2 text-xs border rounded-xl px-3 py-2 transition"
-        style={isUploading
-          ? { color: 'var(--dc-text-muted)', background: 'rgba(124,58,237,0.06)', border: '1px solid rgba(124,58,237,0.25)', cursor: 'not-allowed' }
-          : { color: 'var(--dc-text-secondary)', background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)', cursor: 'pointer' }
-        }
+      <button
+        type="button"
+        onClick={() => setHuddleOpen(true)}
+        className="inline-flex items-center gap-2 text-xs rounded-xl px-3 py-2 transition"
+        style={{ color: '#08784f', background: 'rgba(16,185,129,.12)', border: '1px solid rgba(16,185,129,.28)' }}
       >
-        <input
-          type="file"
-          accept=".pdf,.png,.jpg,.jpeg,.txt,.md,.puml,.mmd,.mermaid,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
-          className="hidden"
-          onChange={async (e) => {
-            const selectedFile = e.target.files?.[0];
-            if (!selectedFile) return;
-            await handleUpload(selectedFile);
-            e.target.value = '';
-          }}
-          disabled={isUploading}
-        />
-        <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 16v-7m0 0l-3.5 3.5M12 9l3.5 3.5M19 16V7a2 2 0 00-2-2h-6a2 2 0 00-2 2v5.5" />
-        </svg>
+        <Video size={14} />
+        Huddle
+      </button>
+
+      {canUpload && <button
+        type="button"
+        onClick={() => { setUploadError(''); setUploadOpen(true); }}
+        disabled={isUploading}
+        className="inline-flex items-center gap-2 text-xs border rounded-xl px-3 py-2 transition disabled:opacity-50"
+        style={{ color: 'var(--dc-text-secondary)', background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)', cursor: isUploading ? 'not-allowed' : 'pointer' }}
+      >
+        <UploadCloud size={14} />
         {isUploading ? 'Uploading…' : 'Upload'}
-      </label>}
+      </button>}
+
+      {uploadOpen && (
+        <div className="fixed inset-0 z-[100] grid place-items-center p-5" style={{ background: 'rgba(15,23,42,.36)', backdropFilter: 'blur(5px)' }} onClick={() => !isUploading && setUploadOpen(false)}>
+          <section className="w-full max-w-lg rounded-2xl p-5" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border)', boxShadow: '0 24px 70px rgba(15,23,42,.22)' }} onClick={(event) => event.stopPropagation()}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex gap-3">
+                <span className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: 'var(--dc-brand-dim)', color: 'var(--dc-brand)' }}><UploadCloud size={19} /></span>
+                <div><h2 className="text-sm font-semibold">Upload knowledge</h2><p className="text-[11px] mt-1" style={{ color: 'var(--dc-text-muted)' }}>{canSelfApprove ? 'Your role can index this file immediately.' : 'Files enter the approval queue before indexing.'}</p></div>
+              </div>
+              <button type="button" onClick={() => setUploadOpen(false)} disabled={isUploading} className="p-1.5 rounded-lg" style={{ color: 'var(--dc-text-muted)' }} aria-label="Close upload dialog"><X size={16} /></button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 my-4">
+              <div className="rounded-xl p-3 flex gap-2" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}><ShieldCheck size={15} style={{ color: 'var(--dc-green)' }} /><div><p className="text-[11px] font-semibold">Maximum 15MB</p><p className="text-[10px] mt-0.5" style={{ color: 'var(--dc-text-muted)' }}>Validated again by the API</p></div></div>
+              <div className="rounded-xl p-3 flex gap-2" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}><FileCheck2 size={15} style={{ color: 'var(--dc-brand)' }} /><div><p className="text-[11px] font-semibold">Approved formats</p><p className="text-[10px] mt-0.5" style={{ color: 'var(--dc-text-muted)' }}>PDF, MD, TXT, images and Office</p></div></div>
+            </div>
+
+            <label className="block rounded-xl border border-dashed p-5 text-center cursor-pointer" style={{ borderColor: selectedFile ? 'var(--dc-brand)' : 'var(--dc-border-strong)', background: selectedFile ? 'var(--dc-brand-dim)' : 'var(--dc-surface-1)' }}>
+              <input type="file" accept=".pdf,.png,.jpg,.jpeg,.txt,.md,.puml,.mmd,.mermaid,.doc,.docx,.xls,.xlsx,.ppt,.pptx" className="hidden" disabled={isUploading} onChange={(event) => { setSelectedFile(event.target.files?.[0] || null); setUploadError(''); }} />
+              <UploadCloud size={22} className="mx-auto mb-2" style={{ color: 'var(--dc-brand)' }} />
+              <p className="text-xs font-medium">{selectedFile ? selectedFile.name : 'Choose a file to upload'}</p>
+              <p className="text-[10px] mt-1" style={{ color: 'var(--dc-text-muted)' }}>{selectedFile ? `${(selectedFile.size / 1024 / 1024).toFixed(2)} MB` : 'PDF, Markdown, TXT, PNG, JPG, DOCX, XLSX, PPTX and diagrams'}</p>
+            </label>
+
+            <label className="block text-[11px] font-medium mt-4">Minimum access level<select value={accessRole} onChange={(event) => setAccessRole(event.target.value)} className="w-full mt-1.5 rounded-lg px-3 py-2" style={{ background: 'var(--dc-surface-1)', color: 'var(--dc-text-primary)', border: '1px solid var(--dc-border)' }}><option value="viewer">Everyone in workspace</option><option value="member">Members and above</option>{['editor', 'admin', 'owner'].includes(user.role) && <option value="editor">Editors and above</option>}{['admin', 'owner'].includes(user.role) && <option value="admin">Admins and owner</option>}{user.role === 'owner' && <option value="owner">Owner only</option>}</select></label>
+            {uploadError && <p className="text-[11px] mt-3 rounded-lg px-3 py-2" style={{ color: 'var(--dc-red)', background: 'rgba(244,63,94,.08)' }}>{uploadError}</p>}
+            <div className="flex justify-end gap-2 mt-5"><button type="button" onClick={() => setUploadOpen(false)} disabled={isUploading} className="px-4 py-2 rounded-lg text-xs" style={{ border: '1px solid var(--dc-border)' }}>Cancel</button><button type="button" onClick={() => handleUpload(selectedFile)} disabled={!selectedFile || isUploading} className="px-4 py-2 rounded-lg text-xs font-semibold disabled:opacity-50" style={{ background: 'var(--dc-brand)', color: 'white' }}>{isUploading ? 'Uploading…' : canSelfApprove ? 'Upload and index' : 'Upload for approval'}</button></div>
+          </section>
+        </div>
+      )}
+
+      {huddleOpen && (
+        <div className="fixed inset-0 z-[100] grid place-items-center p-5" style={{ background: 'rgba(15,23,42,.36)', backdropFilter: 'blur(5px)' }} onClick={() => setHuddleOpen(false)}>
+          <section className="w-full max-w-sm rounded-2xl p-5 text-center" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border)', boxShadow: '0 24px 70px rgba(15,23,42,.22)' }} onClick={(event) => event.stopPropagation()}>
+            <span className="mx-auto w-12 h-12 rounded-2xl flex items-center justify-center" style={{ color: '#08784f', background: 'rgba(16,185,129,.14)', border: '1px solid rgba(16,185,129,.25)' }}><Video size={22} /></span>
+            <h2 className="text-base font-semibold mt-3">Nexconn Huddle</h2>
+            <p className="text-xs mt-2 leading-relaxed" style={{ color: 'var(--dc-text-muted)' }}>{huddleUrl ? 'Open the configured audio room for this workspace.' : 'The Huddle launcher is ready. Configure your Nexconn Call room URL to enable live audio.'}</p>
+            {!huddleUrl && <code className="block text-[10px] rounded-lg px-2 py-2 mt-3" style={{ background: 'var(--dc-surface-1)', color: 'var(--dc-brand)', border: '1px solid var(--dc-border)' }}>VITE_NEXCONN_HUDDLE_URL=https://…</code>}
+            <div className="flex gap-2 mt-5"><button type="button" onClick={() => setHuddleOpen(false)} className="flex-1 px-4 py-2 rounded-lg text-xs" style={{ border: '1px solid var(--dc-border)' }}>Close</button><button type="button" disabled={!huddleUrl} onClick={() => window.open(`${huddleUrl}?workspace=${encodeURIComponent(user.workspace_id)}`, '_blank', 'noopener,noreferrer')} className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold disabled:opacity-40" style={{ background: 'var(--dc-green)', color: 'white' }}>Join huddle <ExternalLink size={12} /></button></div>
+          </section>
+        </div>
+      )}
 
       {isOpen && (
         <div

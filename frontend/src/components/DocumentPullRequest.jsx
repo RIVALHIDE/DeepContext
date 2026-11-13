@@ -8,28 +8,34 @@ import { waitForIngestProgress } from '../utils/ingestProgress.util';
  * Admins can Approve (triggers ChromaDB ingestion) or Reject.
  */
 export default function DocumentPullRequest({ user, onComplete }) {
-  const canApprove = ['admin', 'owner'].includes(user?.role);
+  const canApprove = ['editor', 'admin', 'owner'].includes(user?.role);
   const [pendingDocs, setPendingDocs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [actioningId, setActioningId] = useState(null);
   const [feedback, setFeedback] = useState(null);
 
-  const fetchPending = useCallback(async () => {
+  const fetchPending = useCallback(async (announce = false) => {
     setLoading(true);
     try {
-      const res = await api.get('/pending-documents');
-    setPendingDocs(res.data?.documents ?? []);
+      const res = await api.get('/pending-documents', {
+        params: { refresh: Date.now() },
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+      setPendingDocs(res.data?.documents ?? []);
+      if (announce) setFeedback({ type: 'success', message: 'Pull requests refreshed.' });
     } catch (err) {
       console.error('Failed to fetch pending documents', err);
+      setFeedback({ type: 'error', message: err?.response?.data?.detail || 'Could not refresh pull requests.' });
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    fetchPending();
-    window.addEventListener('documents-pending', fetchPending);
-    return () => window.removeEventListener('documents-pending', fetchPending);
+    fetchPending(false);
+    const refreshFromUpload = () => fetchPending(false);
+    window.addEventListener('documents-pending', refreshFromUpload);
+    return () => window.removeEventListener('documents-pending', refreshFromUpload);
   }, [fetchPending]);
 
   const handleApprove = async (documentId) => {
@@ -41,7 +47,7 @@ export default function DocumentPullRequest({ user, onComplete }) {
         type: 'success',
         message: res.data?.message || 'Document approved. Ingestion started.',
       });
-      await fetchPending();
+      await fetchPending(false);
       if (res.data?.job_id) {
         const progress = await waitForIngestProgress(res.data.job_id, {
           onEvent: (event) => setFeedback({ type: event.stage === 'failed' ? 'error' : 'success', message: event.message || 'Processing document…' }),
@@ -72,7 +78,7 @@ export default function DocumentPullRequest({ user, onComplete }) {
         type: 'success',
         message: res.data?.message || 'Document rejected.',
       });
-      await fetchPending();
+      await fetchPending(false);
     } catch (err) {
       setFeedback({
         type: 'error',
@@ -104,7 +110,11 @@ export default function DocumentPullRequest({ user, onComplete }) {
           Document Pull Requests
         </span>
         <button
-          onClick={fetchPending}
+          onClick={() => fetchPending(true)}
+          disabled={loading}
+          type="button"
+          aria-label={loading ? 'Refreshing pull requests' : 'Refresh pull requests'}
+          title={loading ? 'Refreshing pull requests' : 'Refresh pull requests'}
           className="p-1 rounded transition"
           style={{ color: 'var(--dc-text-muted)' }}
           onMouseEnter={(e) =>
@@ -237,7 +247,7 @@ export default function DocumentPullRequest({ user, onComplete }) {
                   <X size={12} />
                   Reject
                 </button>
-              </div> : <p className="text-[11px]" style={{ color: 'var(--dc-text-muted)' }}>Waiting for an admin to approve</p>}
+              </div> : <p className="text-[11px]" style={{ color: 'var(--dc-text-muted)' }}>Waiting for an editor or admin to approve</p>}
             </div>
           ))
         )}

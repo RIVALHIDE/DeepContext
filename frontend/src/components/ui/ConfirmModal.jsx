@@ -50,7 +50,7 @@ export default function ConfirmModal({
     window.addEventListener('keydown', onKey);
     return () => {
       window.removeEventListener('keydown', onKey);
-      try { previouslyFocused.current?.focus(); } catch {}
+      try { previouslyFocused.current?.focus(); } catch { previouslyFocused.current = null; }
     };
   }, [isOpen, onCancel, onConfirm]);
 

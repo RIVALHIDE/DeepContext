@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import { RefreshCw, GitBranch, FileCheck, BarChart3 } from 'lucide-react';
+import { RefreshCw, GitBranch, FileCheck, BarChart3, Bot, MessagesSquare } from 'lucide-react';
 import DocCard from './docs/DocCard';
 import IngestSidebarRow from './IngestSidebarRow';
 import NexconnChat from './NexconnChat';
@@ -33,6 +33,7 @@ export default function WorkspaceLayout({
   ingestState,
   isIngestActive,
   deletingDocName,
+  isRefreshingDocs,
   onDelete,
   onAccessChange,
   onRefresh,
@@ -46,6 +47,8 @@ export default function WorkspaceLayout({
   const [flowData, setFlowData] = useState(null);
   const [lastSources, setLastSources] = useState([]);
   const [activeTab, setActiveTab] = useState('pullrequests');
+  const [chatMode, setChatMode] = useState('ai');
+  const showIngestSidebar = ['uploading', 'processing', 'pending_approval', 'failed'].includes(ingestState?.status);
 
   const handleChatResponse = useCallback((data) => {
     if (!data) return;
@@ -66,9 +69,11 @@ export default function WorkspaceLayout({
 
   return (
     <div
-      className="grid h-screen"
+      className="dc-workspace-grid grid h-screen"
       style={{
-        gridTemplateColumns: '280px 1fr 400px',
+        gridTemplateColumns: '235px minmax(520px, 1fr) 390px',
+        gap: '12px',
+        padding: '12px',
         background: 'var(--dc-bg)',
         color: 'var(--dc-text-primary)',
       }}
@@ -80,12 +85,14 @@ export default function WorkspaceLayout({
         className="flex flex-col overflow-hidden"
         style={{
           background: 'var(--dc-surface-0)',
-          borderRight: '1px solid var(--dc-border)',
+          border: '1px solid var(--dc-border)',
+          borderRadius: '14px',
+          boxShadow: 'var(--dc-shadow-card)',
         }}
       >
         {/* Brand */}
         <div
-          className="p-6 border-b flex items-center"
+          className="px-4 py-4 border-b flex items-center"
           style={{ borderColor: 'var(--dc-border)' }}
         >
           <LogoLockup state="idle" size={32} />
@@ -110,7 +117,7 @@ export default function WorkspaceLayout({
           )}
 
           <div className="space-y-2">
-            {isIngestActive && <IngestSidebarRow ingestState={ingestState} />}
+            {showIngestSidebar && <IngestSidebarRow ingestState={ingestState} />}
 
             {(!docs || docs.length === 0) && !isIngestActive && (
               <div
@@ -128,8 +135,8 @@ export default function WorkspaceLayout({
               <DocCard
                 key={i}
                 doc={doc}
-                onDelete={['owner', 'admin'].includes(user.role) ? onDelete : null}
-                onAccessChange={['owner', 'admin'].includes(user.role) ? onAccessChange : null}
+                onDelete={['owner', 'admin', 'editor'].includes(user.role) ? onDelete : null}
+                onAccessChange={['owner', 'admin', 'editor'].includes(user.role) ? onAccessChange : null}
                 userRole={user.role}
                 isDeleting={deletingDocName === doc.name}
               />
@@ -147,10 +154,12 @@ export default function WorkspaceLayout({
 
         {/* Refresh button */}
         <button
-          onClick={onRefresh}
+          onClick={() => onRefresh?.()}
+          disabled={isRefreshingDocs}
           type="button"
-          title="Refresh document list"
-          className="p-4 border-t flex items-center gap-2 transition shrink-0"
+          title={isRefreshingDocs ? 'Refreshing document list' : 'Refresh document list'}
+          aria-label={isRefreshingDocs ? 'Refreshing knowledge base' : 'Refresh knowledge base'}
+          className="p-4 border-t flex items-center gap-2 transition shrink-0 disabled:opacity-60"
           style={{
             borderColor: 'var(--dc-border)',
             color: 'var(--dc-text-secondary)',
@@ -162,7 +171,8 @@ export default function WorkspaceLayout({
             (e.currentTarget.style.color = 'var(--dc-text-secondary)')
           }
         >
-          <RefreshCw size={16} /> <span className="text-xs">Refresh</span>
+          <RefreshCw size={16} className={isRefreshingDocs ? 'animate-spin' : ''} />
+          <span className="text-xs">{isRefreshingDocs ? 'Refreshing…' : 'Refresh'}</span>
         </button>
       </aside>
 
@@ -172,33 +182,32 @@ export default function WorkspaceLayout({
       <main
         className="flex flex-col overflow-hidden"
         style={{
-          background:
-            'linear-gradient(to bottom, var(--dc-surface-0), var(--dc-surface-3))',
+          background: 'var(--dc-surface-0)',
+          border: '1px solid var(--dc-border)',
+          borderRadius: '14px',
+          boxShadow: 'var(--dc-shadow-card)',
         }}
       >
         {/* Chat header */}
         <div
-          className="flex items-center gap-2 px-6 py-3 border-b shrink-0"
+          className="flex items-center justify-between gap-3 px-6 py-2 border-b shrink-0"
           style={{ borderColor: 'var(--dc-border)' }}
         >
-          <div
-            className="w-2 h-2 rounded-full"
-            style={{ background: 'var(--dc-green)', boxShadow: '0 0 8px var(--dc-green)' }}
-          />
-          <span
-            className="text-xs font-semibold"
-            style={{ color: 'var(--dc-text-secondary)' }}
-          >
-            Nexconn Channel
-          </span>
-          <span className="text-[10px]" style={{ color: 'var(--dc-text-muted)' }}>
-            · {user?.name ?? 'User'}
-          </span>
+          <div className="flex items-center gap-2">
+            <div className="w-2 h-2 rounded-full" style={{ background: 'var(--dc-green)', boxShadow: '0 0 8px var(--dc-green)' }} />
+            <span className="text-xs font-semibold" style={{ color: 'var(--dc-text-secondary)' }}>{chatMode === 'ai' ? 'DeepContext AI' : 'Nexconn Channel'}</span>
+            <span className="text-[10px]" style={{ color: 'var(--dc-text-muted)' }}>· {user?.name ?? 'User'}</span>
+          </div>
+          <div className="flex rounded-lg p-1" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}>
+            <button type="button" onClick={() => setChatMode('ai')} className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[11px]" style={{ background: chatMode === 'ai' ? 'var(--dc-brand-dim)' : 'transparent', color: chatMode === 'ai' ? 'var(--dc-brand-glow)' : 'var(--dc-text-muted)' }}><Bot size={13} />AI assistant</button>
+            <button type="button" onClick={() => setChatMode('nexconn')} className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[11px]" style={{ background: chatMode === 'nexconn' ? 'var(--dc-brand-dim)' : 'transparent', color: chatMode === 'nexconn' ? 'var(--dc-brand-glow)' : 'var(--dc-text-muted)' }}><MessagesSquare size={13} />Nexconn</button>
+          </div>
         </div>
 
         {/* Chat body */}
         <div className="flex-1 overflow-hidden">
           <NexconnChat
+            mode={chatMode}
             user={user}
             ingestState={ingestState}
             onIngestStart={onIngestStart}
@@ -215,39 +224,34 @@ export default function WorkspaceLayout({
           RIGHT PANEL — Interactive Workspace (split top/bottom)
           ═══════════════════════════════════════════════════════ */}
       <aside
-        className="flex flex-col overflow-hidden"
-        style={{
-          background: 'var(--dc-surface-0)',
-          borderLeft: '1px solid var(--dc-border)',
-        }}
+        className="flex flex-col overflow-hidden gap-3"
       >
         {/* Top half — AI Canvas */}
+        <section className="flex flex-col overflow-hidden" style={{ height: '55%', minHeight: '260px', background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border)', borderRadius: '14px', boxShadow: 'var(--dc-shadow-card)' }}>
         <div
           className="flex items-center justify-between px-4 py-3 border-b shrink-0"
           style={{ borderColor: 'var(--dc-border)' }}
         >
           <div className="flex items-center gap-2">
             <GitBranch size={14} style={{ color: 'var(--dc-brand)' }} />
-            <span
-              className="text-xs font-semibold"
-              style={{ color: 'var(--dc-text-secondary)' }}
-            >
-              AI Canvas
-            </span>
+            <div><span className="block text-xs font-semibold" style={{ color: 'var(--dc-text-primary)' }}>Live Context Board</span><span className="block text-[9px] mt-0.5" style={{ color: 'var(--dc-text-muted)' }}>AI Canvas powered by React Flow</span></div>
           </div>
         </div>
 
         <div className="flex-1 p-3 overflow-hidden" style={{ minHeight: 0 }}>
           <AICanvas flowData={flowData} />
         </div>
+        </section>
 
         {/* Bottom half — Tabbed area */}
-        <div
-          className="border-t"
+        <section
+          className="flex-1 overflow-hidden"
           style={{
-            borderColor: 'var(--dc-border)',
-            height: '45%',
             minHeight: '180px',
+            background: 'var(--dc-surface-0)',
+            border: '1px solid var(--dc-border)',
+            borderRadius: '14px',
+            boxShadow: 'var(--dc-shadow-card)',
           }}
         >
           {/* Tab bar */}
@@ -280,11 +284,11 @@ export default function WorkspaceLayout({
           </div>
 
           {/* Tab content */}
-          <div className="h-[calc(100%-37px)]">
+          <div style={{ height: 'calc(100% - 38px)' }}>
             {activeTab === 'pullrequests' && <DocumentPullRequest user={user} onComplete={onRefresh} />}
             {activeTab === 'metrics' && <CitationMetrics sources={lastSources} />}
           </div>
-        </div>
+        </section>
       </aside>
     </div>
   );

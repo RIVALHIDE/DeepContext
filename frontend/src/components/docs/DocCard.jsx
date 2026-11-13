@@ -46,7 +46,8 @@ export default function DocCard({ doc, onDelete, isDeleting, onAccessChange, use
       {onAccessChange && <select aria-label={`Access for ${doc.displayName || doc.name}`} value={doc.accessRole || 'viewer'} onChange={(event) => onAccessChange(doc.name, event.target.value)} className="w-full text-[10px] mt-2 rounded p-1" style={{ background: 'var(--dc-bg)', color: 'var(--dc-text-secondary)' }}>
         <option value="viewer">Everyone in workspace</option>
         <option value="member">Members and above</option>
-        <option value="admin">Admins and owner</option>
+        {['editor', 'admin', 'owner'].includes(userRole) && <option value="editor">Editors and above</option>}
+        {['admin', 'owner'].includes(userRole) && <option value="admin">Admins and owner</option>}
         {userRole === 'owner' && <option value="owner">Owner only</option>}
       </select>}
     </div>

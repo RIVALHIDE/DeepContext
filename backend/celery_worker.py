@@ -31,7 +31,7 @@ def verify_chroma_on_worker_start(sender, **kwargs):
     print("Celery worker database and Chroma connection verified.")
 
 @app.task(name="process_document_task", bind=True)
-def process_document_task(self, file_source: str, is_slack_upload: bool = False, slack_token: str = None, team_id: str = "default", access_level: int = 0):
+def process_document_task(self, file_source: str, is_slack_upload: bool = False, slack_token: str = None, team_id: str = "default", access_level: float = 0):
     job_id = self.request.id
     os.makedirs(DATA_DIR, exist_ok=True)
 

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, SendHorizontal, Square } from 'lucide-react';
+import { FileText, GitBranch, Search, SendHorizontal, Sparkles, Square, Terminal } from 'lucide-react';
 import api from '../utils/api.util';
 import ChatHistoryDrawer from './ChatHistoryDrawer';
 import IngestProgressBanner from './IngestProgressBanner';
@@ -13,6 +13,13 @@ import {
   maybeSetChatTitleFromFirstMessage,
   touchChatSession,
 } from '../utils/chatSessions.util';
+
+const SLASH_COMMANDS = [
+  { command: '/extract_diagram', label: 'Extract and graph a visual flow', icon: GitBranch },
+  { command: '/search', label: 'Search all permitted documents', icon: Search },
+  { command: '/summarize', label: 'Summarize retrieved knowledge', icon: FileText },
+  { command: '/help', label: 'Show available assistant commands', icon: Sparkles },
+];
 
 function buildStreamUrl(path) {
   const base = String(api.defaults.baseURL ?? '').replace(/\/$/, '');
@@ -122,6 +129,8 @@ export default function ChatWindow({
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState("");
     const [isTyping, setIsTyping] = useState(false);
+    const [thinkingStage, setThinkingStage] = useState('retrieving');
+    const [isReceivingTokens, setIsReceivingTokens] = useState(false);
     const [activeSessionId, setActiveSessionIdState] = useState(null);
     const [sessionsVersion, setSessionsVersion] = useState(0);
     const messagesContainerRef = useRef(null);
@@ -131,7 +140,7 @@ export default function ChatWindow({
     const shouldAutoScrollRef = useRef(true);
     const forceAutoScrollRef = useRef(false);
 
-    const isIngesting = ingestState?.status === 'uploading' || ingestState?.status === 'processing';
+    const isDocumentProcessing = ingestState?.status === 'uploading' || ingestState?.status === 'processing';
 
     const username = user?.username ?? null;
 
@@ -161,6 +170,7 @@ export default function ChatWindow({
         activeAssistantMessageIdRef.current = null;
         setActiveSessionIdState(sessionId);
         setIsTyping(false);
+        setIsReceivingTokens(false);
         setInput('');
 
         try {
@@ -242,6 +252,7 @@ export default function ChatWindow({
         setMessages([]);
         setInput('');
         setIsTyping(false);
+        setIsReceivingTokens(false);
         if (newSession?.sessionId) {
           setActiveSessionIdState(newSession.sessionId);
         }
@@ -250,7 +261,7 @@ export default function ChatWindow({
   
     const sendMessage = async () => {
       const text = input.trim();
-      if (!text || isTyping || isIngesting) return;
+      if (!text || isTyping) return;
       if (!username || !effectiveSessionId) return;
 
       forceAutoScrollRef.current = true;
@@ -271,6 +282,8 @@ export default function ChatWindow({
       ]);
       setInput("");
       setIsTyping(true);
+      setThinkingStage('retrieving');
+      setIsReceivingTokens(false);
       activeAssistantMessageIdRef.current = assistantMessageId;
 
       const controller = new AbortController();
@@ -331,13 +344,28 @@ export default function ChatWindow({
         let buffer = '';
         let doneReceived = false;
         let streamedAnswer = '';
+        let guardrail = null;
 
         const processBlock = async (block) => {
           const parsed = parseSseEventBlock(block);
           if (!parsed) return;
 
-          // Ignore thinking event — UI already shows spinner
           if (parsed.event === 'thinking') {
+            const stage = parsed.data?.stage;
+            if (['retrieving', 'drafting', 'verifying'].includes(stage)) {
+              setThinkingStage(stage);
+            }
+            return;
+          }
+
+          if (parsed.event === 'guardrail') {
+            guardrail = parsed.data || {};
+            setIsReceivingTokens(true);
+            updateAssistantMessage(assistantMessageId, {
+              blocked: true,
+              guardrail,
+              streaming: true,
+            });
             return;
           }
 
@@ -345,6 +373,7 @@ export default function ChatWindow({
             const token = String(parsed.data?.token ?? '');
             if (!token) return;
             receivedAnyToken = true;
+            setIsReceivingTokens(true);
             streamedAnswer += token;
             updateAssistantMessage(assistantMessageId, {
               content: streamedAnswer,
@@ -365,10 +394,12 @@ export default function ChatWindow({
               content: finalAnswer,
               diagrams,
               sources,
+              blocked: Boolean(parsed.data?.blocked || guardrail?.blocked),
+              guardrail: parsed.data?.guardrail || guardrail,
               streaming: false,
             });
 
-            onResponse?.({ answer: finalAnswer, diagrams, sources });
+            onResponse?.({ answer: finalAnswer, diagrams, sources, blocked: Boolean(parsed.data?.blocked || guardrail?.blocked) });
 
             setSessionsVersion((v) => v + 1);
             doneReceived = true;
@@ -391,7 +422,6 @@ export default function ChatWindow({
             const block = buffer.slice(0, boundaryIndex).trim();
             buffer = buffer.slice(boundaryIndex + 2);
             if (block) {
-              // eslint-disable-next-line no-await-in-loop
               await processBlock(block);
               if (doneReceived) break;
             }
@@ -438,10 +468,15 @@ export default function ChatWindow({
       }
       activeAssistantMessageIdRef.current = null;
       setIsTyping(false);
+      setIsReceivingTokens(false);
     };
+
+    const slashMatches = input.startsWith('/') && !input.includes(' ')
+      ? SLASH_COMMANDS.filter((item) => item.command.startsWith(input.toLowerCase()))
+      : [];
   
     return (
-      <div className="flex-1 flex flex-col p-6 min-h-100 mx-auto w-full">
+      <div className="flex-1 flex flex-col p-4 min-h-100 mx-auto w-full">
         <ChatHistoryDrawer
           user={user}
           activeSessionId={effectiveSessionId}
@@ -452,7 +487,7 @@ export default function ChatWindow({
           onIngestEvent={onIngestEvent}
           onIngestComplete={onIngestComplete}
           onIngestFailed={onIngestFailed}
-          isUploading={isIngesting}
+          isUploading={isDocumentProcessing}
         />
 
         <IngestProgressBanner
@@ -460,15 +495,29 @@ export default function ChatWindow({
           onDismiss={onDismissIngest}
         />
 
+        {slashMatches.length > 0 && (
+          <div className="mb-2 ml-2 w-full max-w-sm rounded-xl overflow-hidden" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border-strong)', boxShadow: '0 14px 38px rgba(30,52,78,.14)' }}>
+            <div className="flex items-center gap-2 px-3 py-2 border-b" style={{ borderColor: 'var(--dc-border)' }}><Terminal size={12} style={{ color: 'var(--dc-brand)' }} /><span className="text-[9px] font-semibold uppercase tracking-widest" style={{ color: 'var(--dc-text-muted)' }}>Commands</span></div>
+            {slashMatches.map((item) => {
+              const Icon = item.icon;
+              return <button key={item.command} type="button" onClick={() => { const value = `${item.command} `; setInput(value); onInputChange?.(value); }} className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-slate-50"><Icon size={13} style={{ color: 'var(--dc-brand)' }} /><div><p className="text-[11px] font-semibold">{item.command}</p><p className="text-[9px] mt-0.5" style={{ color: 'var(--dc-text-muted)' }}>{item.label}</p></div></button>;
+            })}
+          </div>
+        )}
+
         <div
           ref={messagesContainerRef}
-          className="messagesBox flex-1 overflow-y-auto space-y-6 mb-4 pr-4 custom-scrollbar"
+          className="messagesBox flex-1 overflow-y-auto space-y-4 mb-4 pr-2 custom-scrollbar"
         >
           {messages.length === 0 && !isTyping
             ? <WelcomeScreen onSuggestion={(text) => { setInput(text); }} />
-            : messages.map((m) => <MessageBubble key={m.id ?? `${m.role}_${m.content?.slice(0,20)}`} message={m} />)
+            : messages.map((m) => (
+              m.role === 'ai' && m.streaming && !m.content
+                ? null
+                : <MessageBubble key={m.id ?? `${m.role}_${m.content?.slice(0,20)}`} message={m} />
+            ))
           }
-          {isTyping && <ThinkingIndicator />}
+          {isTyping && !isReceivingTokens && <ThinkingIndicator stage={thinkingStage} />}
           <div ref={messagesEndRef} />
         </div>
   
@@ -477,7 +526,7 @@ export default function ChatWindow({
           style={{
             background: 'var(--dc-surface-1)',
             border: `1px solid ${input.trim() || isTyping ? 'var(--dc-brand-border)' : 'var(--dc-border)'}`,
-            boxShadow: input.trim() ? '0 0 0 3px rgba(0,201,177,0.08)' : 'none',
+            boxShadow: input.trim() ? '0 0 0 3px rgba(37,99,235,0.08)' : 'none',
             transition: 'border-color 0.2s, box-shadow 0.2s',
           }}
         >
@@ -499,11 +548,9 @@ export default function ChatWindow({
               }
             }}
             placeholder={
-              isIngesting ? 'Document ingestion in progress…'
-              : isTyping  ? 'Press Esc to stop…'
-                          : 'Ask your knowledge base…  (Shift+Enter for new line)'
+              isTyping  ? 'Press Esc to stop…'
+                          : "Message #channel (Type '/' for commands, Shift+Enter for new line)"
             }
-            disabled={isIngesting}
             rows={1}
             className="flex-1 resize-none bg-transparent text-sm leading-relaxed focus:outline-none custom-scrollbar"
             style={{ color: 'var(--dc-text-primary)', minHeight: '36px', maxHeight: '140px' }}
@@ -512,11 +559,11 @@ export default function ChatWindow({
           <button
             type="button"
             onClick={isTyping ? cancelStreaming : sendMessage}
-            disabled={isIngesting || (!isTyping && !input.trim())}
+            disabled={!isTyping && !input.trim()}
             className="shrink-0 flex items-center justify-center w-9 h-9 rounded-xl transition-all"
             style={{
-              background: isTyping ? 'var(--dc-red)' : (input.trim() && !isIngesting) ? 'var(--dc-brand)' : 'var(--dc-surface-2)',
-              color: (isTyping || (input.trim() && !isIngesting)) ? 'var(--dc-text-inverse)' : 'var(--dc-text-muted)',
+              background: isTyping ? 'var(--dc-red)' : input.trim() ? 'var(--dc-brand)' : 'var(--dc-surface-2)',
+              color: (isTyping || input.trim()) ? 'var(--dc-text-inverse)' : 'var(--dc-text-muted)',
               boxShadow: isTyping ? '0 0 16px rgba(244,63,94,0.4)' : (input.trim() ? 'var(--dc-glow-brand)' : 'none'),
             }}
             aria-label={isTyping ? 'Stop' : 'Send'}

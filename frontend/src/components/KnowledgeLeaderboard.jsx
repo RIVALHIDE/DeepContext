@@ -15,9 +15,9 @@ const TIERS = [
     label: 'Silver',
     threshold: 5,
     icon: Medal,
-    color: '#CBD5E1',
-    bg: 'rgba(203, 213, 225, 0.1)',
-    border: 'rgba(203, 213, 225, 0.25)',
+    color: '#64748B',
+    bg: 'rgba(100, 116, 139, 0.09)',
+    border: 'rgba(100, 116, 139, 0.22)',
   },
   {
     key: 'bronze',

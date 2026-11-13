@@ -308,8 +308,8 @@ class Invitation(BaseModel):
 
 
 def validate_assignment(role, actor):
-    if role not in ('viewer', 'member', 'admin'):
-        raise HTTPException(422, 'Choose viewer, member or admin')
+    if role not in ('viewer', 'member', 'editor', 'admin'):
+        raise HTTPException(422, 'Choose viewer, member, editor or admin')
     if role == 'admin' and actor['role'] != 'owner':
         raise HTTPException(403, 'Only the owner can grant admin access')
 

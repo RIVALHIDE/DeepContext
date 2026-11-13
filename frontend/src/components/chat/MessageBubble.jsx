@@ -1,9 +1,11 @@
 import MarkdownRenderer from '../MarkdownRenderer';
 import SonarGlyph from '../brand/SonarGlyph';
+import { ShieldAlert } from 'lucide-react';
 
 export default function MessageBubble({ message }) {
   const isHuman = message.role === 'human';
   const isStreaming = message.streaming;
+  const isBlocked = Boolean(message.blocked);
 
   if (isHuman) {
     return (
@@ -11,9 +13,10 @@ export default function MessageBubble({ message }) {
         <div
           className="max-w-[78%] px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap rounded-2xl rounded-br-sm"
           style={{
-            background: 'linear-gradient(135deg, #0E7966 0%, #0A6358 100%)',
-            color: '#E2F7F4',
-            boxShadow: '0 2px 12px rgba(0,201,177,0.15)',
+            background: 'linear-gradient(135deg, #EFF6FF 0%, #E8F0FE 100%)',
+            color: 'var(--dc-text-primary)',
+            border: '1px solid var(--dc-brand-border)',
+            boxShadow: '0 4px 14px rgba(37,99,235,0.08)',
           }}
         >
           {message.content}
@@ -31,12 +34,19 @@ export default function MessageBubble({ message }) {
       <div
         className="flex-1 max-w-[84%] rounded-2xl rounded-tl-sm px-4 py-3 overflow-hidden"
         style={{
-          background: 'var(--dc-surface-1)',
-          border: `1px solid ${isStreaming ? 'var(--dc-brand-border)' : 'var(--dc-border)'}`,
+          background: isBlocked ? 'rgba(245, 158, 11, 0.07)' : 'var(--dc-surface-1)',
+          border: `1px solid ${isBlocked ? 'rgba(245, 158, 11, 0.32)' : isStreaming ? 'var(--dc-brand-border)' : 'var(--dc-border)'}`,
           boxShadow: isStreaming ? '0 2px 16px rgba(0,201,177,0.08)' : 'none',
           transition: 'border-color 0.3s, box-shadow 0.3s',
         }}
       >
+        {isBlocked && (
+          <div className="flex items-center gap-2 mb-2 pb-2 border-b" style={{ color: '#b45309', borderColor: 'rgba(245, 158, 11, 0.22)' }}>
+            <ShieldAlert size={14} />
+            <span className="text-[10px] font-bold uppercase tracking-wider">Access policy</span>
+            {message.guardrail?.minimum_role && <span className="ml-auto text-[9px] font-semibold">Requires {message.guardrail.minimum_role}</span>}
+          </div>
+        )}
         <MarkdownRenderer
           content={message.content}
           diagrams={message.diagrams || []}

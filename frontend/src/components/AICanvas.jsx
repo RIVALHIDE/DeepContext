@@ -1,11 +1,9 @@
-import { useCallback, useMemo } from 'react';
+import { useMemo } from 'react';
 import {
   ReactFlow,
   Background,
   Controls,
   MiniMap,
-  applyNodeChanges,
-  applyEdgeChanges,
   useNodesState,
   useEdgesState,
 } from '@xyflow/react';
@@ -102,10 +100,10 @@ export default function AICanvas({ flowData }) {
           fitView
           fitViewOptions={{ padding: 0.2 }}
           proOptions={{ hideAttribution: true }}
-          colorMode="dark"
+          colorMode="light"
         >
           <Background
-            color="rgba(255,255,255,0.04)"
+            color="rgba(71, 85, 105, 0.12)"
             gap={20}
             size={1.5}
           />
@@ -118,7 +116,7 @@ export default function AICanvas({ flowData }) {
           />
           <MiniMap
             nodeColor="var(--dc-brand)"
-            maskColor="rgba(0,0,0,0.4)"
+            maskColor="rgba(226,232,240,0.62)"
             style={{
               backgroundColor: 'var(--dc-surface-0)',
               border: '1px solid var(--dc-border)',
