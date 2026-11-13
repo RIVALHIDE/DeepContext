@@ -1,0 +1,54 @@
+/* ═══════════════════════════════════════════════════
+   DEEPCONTEXT — Design Token System
+═══════════════════════════════════════════════════ */
+
+:root {
+  /* Brand */
+  --dc-brand:        #00C9B1;
+  --dc-brand-glow:   #00F5D4;
+  --dc-brand-dim:    rgba(0, 201, 177, 0.12);
+  --dc-brand-border: rgba(0, 201, 177, 0.28);
+
+  --dc-violet:       #7C3AED;
+  --dc-violet-dim:   rgba(124, 58, 237, 0.12);
+
+  --dc-red:          #F43F5E;
+  --dc-green:        #10B981;
+  --dc-amber:        #F59E0B;
+
+  /* Surfaces */
+  --dc-bg:           #090E1A;
+  --dc-surface-0:    #0D1526;
+  --dc-surface-1:    #111D35;
+  --dc-surface-2:    #162140;
+  --dc-surface-3:    #1C2A4E;
+
+  /* Text */
+  --dc-text-primary:   #E2EAF4;
+  --dc-text-secondary: #8FA3BF;
+  --dc-text-muted:     #4A6180;
+  --dc-text-inverse:   #090E1A;
+
+  /* Borders */
+  --dc-border:         rgba(255,255,255,0.07);
+  --dc-border-strong:  rgba(255,255,255,0.13);
+
+  /* Radii */
+  --dc-radius-sm:  8px;
+  --dc-radius-md:  12px;
+  --dc-radius-lg:  18px;
+  --dc-radius-xl:  24px;
+  --dc-radius-full: 9999px;
+
+  /* Motion */
+  --dc-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dc-ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+  --dc-duration-fast: 120ms;
+  --dc-duration-base: 200ms;
+  --dc-duration-slow: 350ms;
+
+  /* Glow shadows */
+  --dc-glow-brand:  0 0 24px rgba(0, 201, 177, 0.35), 0 0 8px rgba(0, 201, 177, 0.2);
+  --dc-glow-violet: 0 0 20px rgba(124, 58, 237, 0.4);
+  --dc-shadow-card: 0 4px 24px rgba(0, 0, 0, 0.4);
+}

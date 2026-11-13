@@ -1,0 +1,152 @@
+services:
+
+  # ── Redis ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: deepcontext_redis
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # ── MongoDB ─────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: deepcontext_mongo
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=deepcontext
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── PlantUML Server ─────────────────────────────────────
+  plantuml:
+    image: plantuml/plantuml-server:jetty
+    container_name: deepcontext_plantuml
+    ports:
+      - "8080:8080"
+    environment:
+      - PLANTUML_LIMIT_SIZE=16384
+    restart: unless-stopped
+
+  # ── ChromaDB HTTP Server ────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: deepcontext_chroma
+    volumes:
+      - chroma_data:/data
+    environment:
+      - ANONYMIZED_TELEMETRY=false
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── FastAPI Backend ─────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: deepcontext_backend
+    env_file:
+      - ./backend/.env
+    ports:
+      - "2020:2020"
+    volumes:
+      - ./backend:/app 
+      - ./backend/data:/app/data
+      - huggingface_cache:/root/.cache/huggingface
+    environment:
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - CHROMA_COLLECTION_NAME=deepcontext_v2
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URL=mongodb://mongo:27017
+      - MONGO_DB_NAME=deepcontext
+      - PLANTUML_SERVER_URL=http://plantuml:8080
+      - NEXCONN_API_BASE_URL=${NEXCONN_API_BASE_URL:-}
+      - NEXCONN_API_TOKEN=${NEXCONN_API_TOKEN:-}
+      - HUGGINGFACE_LOCAL_FILES_ONLY=false
+      - RETRIEVAL_SEMANTIC_K=20
+      - RETRIEVAL_BM25_K=20
+      - RETRIEVAL_SEMANTIC_DISTANCE_MAX=6.2
+      - RERANK_ENABLED=true
+      - RERANK_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+      - RERANK_CANDIDATE_K=20
+      - RERANK_TOP_K=5
+      - RERANK_MAX_CHUNK_CHARS=1500
+    depends_on:
+      redis:
+        condition: service_started
+      chromadb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Celery Worker ───────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: deepcontext_celery
+    env_file:
+      - ./backend/.env
+    command: celery -A celery_worker.app worker --loglevel=info
+    volumes:
+      - ./backend:/app
+      - ./backend/data:/app/data
+      - huggingface_cache:/root/.cache/huggingface
+    environment:
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - CHROMA_COLLECTION_NAME=deepcontext_v2
+      - REDIS_URL=redis://redis:6379/0
+      - HUGGINGFACE_LOCAL_FILES_ONLY=false
+      - RETRIEVAL_SEMANTIC_K=20
+      - RETRIEVAL_BM25_K=20
+      - RETRIEVAL_SEMANTIC_DISTANCE_MAX=6.2
+      - RERANK_ENABLED=true
+      - RERANK_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+      - RERANK_CANDIDATE_K=20
+      - RERANK_TOP_K=5
+      - RERANK_MAX_CHUNK_CHARS=1500
+    depends_on:
+      redis:
+        condition: service_started
+      chromadb:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── React Frontend ─────────────────────────────────── ───
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: deepcontext_frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app                      
+      - /app/node_modules   
+    environment:
+      - VITE_API_BASE_URL=http://10.121.162.162:2020
+      - CHOKIDAR_USEPOLLING=true     
+    restart: unless-stopped
+
+# ── Named Volumes (persistent data survives container restarts) ──
+volumes:
+  redis_data:
+  mongo_data:
+  chroma_data:
+  huggingface_cache:
