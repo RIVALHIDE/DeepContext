@@ -20,6 +20,16 @@ Choose a minimum role when uploading a document; the uploader's role is selected
 
 Authentication uses signed HS256 JWTs with an eight-hour expiry in an HttpOnly, SameSite=Lax cookie. JWT sessions are tracked server-side so logout revokes the token. Passwords use salted scrypt hashes. Browser requests include credentials; API callers may supply the same JWT as `Authorization: Bearer <token>`. Requests from unrelated browser origins are rejected. Login attempts are limited per client/email.
 
+For a self-hosted installation, an administrator with terminal access can reset
+a forgotten password without exposing it in shell history. The command prompts
+for the new password twice and revokes that account's existing sessions:
+
+```bash
+cd backend
+source .venv/bin/activate
+python reset_password.py user@example.com
+```
+
 Install the new dependency before restarting API and Celery:
 
 ```bash
@@ -44,7 +54,7 @@ Keep API and frontend on the same browser hostname (both localhost or both the s
 
 Existing anonymous documents and conversations are retained on disk but are not automatically assigned to a workspace. Re-upload and approve the documents you want in a workspace. The old public Slack webhook is disabled until a workspace-bound integration is configured.
 
-The center panel has two separate modes: **AI assistant** is the document-grounded DeepContext chat, while **Nexconn** is a real Nexconn Chat SDK channel. Nexconn is bound to one DeepContext workspace by `NEXCONN_WORKSPACE_ID`; users in any other workspace receive no Nexconn credentials. The App Secret is used only by the backend to sign Nexconn's access-token request and is never returned to the browser.
+The center panel has two separate modes: **AI assistant** is the document-grounded DeepContext chat, while **Nexconn** is a real Nexconn Chat SDK channel. One server-side Nexconn application supports every DeepContext workspace. The backend derives a stable, separate group channel from the authenticated workspace ID, so switching workspaces switches channels without exposing another workspace. The App Secret is used only by the backend to sign Nexconn's access-token request and is never returned to the browser.
 
 Main authentication endpoints: `POST /auth/register`, `/auth/login`, `/auth/logout`, `/auth/workspaces`, `/auth/switch-workspace`, `/auth/invitations`, `/auth/accept-invite`; `GET /auth/me`, `/auth/members`; `PATCH`/`DELETE /auth/members/{user_id}`. Document access is updated with `PATCH /documents/{sourceName}/access` and `{ "access_role": "viewer|member|editor|admin|owner" }`.
 
@@ -261,19 +271,11 @@ GROQ_MEETING_MODEL=openai/gpt-oss-20b
 # Optional (Slack ingestion)
 SLACK_BOT_TOKEN=your_slack_bot_token
 
-# Optional (real Nexconn Chat channel)
+# Optional (real Nexconn Chat + Call SDK huddles)
 # Use the data-center API base URL shown in the Nexconn Console.
 NEXCONN_API_BASE_URL=https://api.sg-light-api.com
 NEXCONN_APP_KEY=
 NEXCONN_APP_SECRET=
-# Copy the active workspace ID from GET /auth/me.
-NEXCONN_WORKSPACE_ID=
-# direct | group | open | community
-NEXCONN_CHANNEL_TYPE=group
-NEXCONN_CHANNEL_ID=
-# Required only when NEXCONN_CHANNEL_TYPE=community.
-NEXCONN_SUBCHANNEL_ID=
-NEXCONN_CHANNEL_NAME=Nexconn Channel
 # sg | bj | na | sa | om
 NEXCONN_AREA_CODE=sg
 
@@ -304,33 +306,35 @@ REDIS_URL=redis://localhost:6379/0
 HUGGINGFACE_LOCAL_FILES_ONLY=false
 ```
 
-### Enable the Nexconn channel
+### Enable Nexconn Chat and Huddle
 
-1. Create a Nexconn application and copy its environment-specific App Key, App Secret, and data-center API base URL into `backend/.env` using the variables above.
-2. Sign in to DeepContext and copy `user.workspace_id` from `GET /auth/me` into `NEXCONN_WORKSPACE_ID`.
-3. Choose a channel type and ID. A group ID must contain only letters and numbers and be at most 64 characters. For a community channel, also provide its subchannel ID.
-4. Restart the FastAPI backend, select **Nexconn** in the center-panel switcher, and connect as the DeepContext workspace owner first.
+1. In the Nexconn Console, create/select an application and activate both **Chat Subscription** and **Call Subscription**.
+2. Copy that application's environment-specific **App Key** and **App Secret** into `backend/.env`. Use the API base URL and area code for the same data center.
+3. Restart the FastAPI backend, select **Nexconn** in the center-panel switcher, and connect as the current DeepContext workspace owner first.
 
-For a group channel, that first owner connection creates the configured Nexconn group if necessary. Later workspace members are registered with opaque Nexconn user IDs and added to the group automatically. Open and community channels must already exist in Nexconn; direct mode treats `NEXCONN_CHANNEL_ID` as the other user's Nexconn ID. The Nexconn SDK is loaded only when the Nexconn tab is opened, so it does not slow the initial AI-assistant page load.
+That first owner connection creates the workspace's derived Nexconn group if necessary. Later workspace members are registered with opaque, workspace-specific Nexconn user IDs and added automatically. Every DeepContext workspace receives a different stable group; no workspace or channel IDs need to be stored in `.env`. The Nexconn SDK is loaded only when the Nexconn tab is opened, so it does not slow the initial AI-assistant page load.
 
-Nexconn chat is available to every authenticated workspace role because it is a collaboration channel, not a document-retrieval path. The backend binds the session to `NEXCONN_WORKSPACE_ID`, returns no App Secret, and permits only the DeepContext owner to create a missing group. Nexconn messages do not bypass Chroma document clearance or the AI query guardrail.
+Nexconn chat and audio huddles are available to every authenticated workspace role because they are collaboration features, not document-retrieval paths. The backend derives the group and active huddle exclusively from the authenticated JWT workspace, returns no App Secret, and permits only that workspace's DeepContext owner to create a missing group. Nexconn messages do not bypass Chroma document clearance or the AI query guardrail.
+
+The Huddle button uses the Nexconn Web Call SDK directly. It creates one active audio room per DeepContext workspace, invites current workspace members, and lets members who open Huddle later join by the saved call ID. Browser microphone access requires either `http://localhost:5173` or an HTTPS deployment; plain LAN addresses such as `http://192.168.x.x:5173` are not secure contexts and cannot use the microphone.
+
+The App Secret is available in the Nexconn application details/credentials page and may be hidden behind a reveal or reset control. It is not the same value as the App Key and must remain in `backend/.env` only. Never add it to `frontend/.env` or expose it through a `VITE_` variable.
 
 Frontend base URL:
 
 ```env
 VITE_API_BASE_URL=http://localhost:2020
-# Optional: URL of your deployed Nexconn Call/huddle experience.
-VITE_NEXCONN_HUDDLE_URL=https://your-call-app.example.com/room
 ```
 
 If `VITE_API_BASE_URL` is not set, frontend falls back to `http://<browser-hostname>:2020`.
-The **Huddle** button opens `VITE_NEXCONN_HUDDLE_URL` with the current workspace ID as
-the `workspace` query parameter. When it is not configured, the UI displays setup guidance
-instead of pretending that a call was connected.
 
 ### Chroma environment matrix
 
 Use the **same** `CHROMA_*` values for the FastAPI process and the Celery worker. A host/port/collection mismatch causes uploads to succeed while chat retrieval stays empty.
+
+DeepContext intentionally uses one shared Chroma collection for all workspaces. Every chunk carries a mandatory `team_id` (the authenticated workspace ID) and `access_level`. Semantic search, BM25 snapshots, diagram lookup, sibling expansion, version replacement, access updates, and deletion all apply the workspace filter. The SQLite document registry and access table are also keyed by `(workspace_id, source_name)`, so two workspaces may upload the same filename without overwriting or exposing each other's data. Client-supplied workspace values are ignored; retrieval scope comes from the signed JWT session.
+
+Do not create a different static `CHROMA_COLLECTION_NAME` for each workspace in `.env`: `.env` is server-wide and cannot follow the active user. Workspace partitioning is performed dynamically using Chroma metadata filters.
 
 | Runtime | `CHROMA_HOST` | `CHROMA_PORT` | `CHROMA_COLLECTION_NAME` |
 |---------|---------------|---------------|--------------------------|
@@ -379,8 +383,6 @@ Create or edit `frontend/.env`:
 
 ```env
 VITE_API_BASE_URL=http://localhost:2020
-# Optional; opens the configured room from the Huddle button.
-VITE_NEXCONN_HUDDLE_URL=https://your-call-app.example.com/room
 ```
 
 The first API/worker startup downloads Hugging Face embedding models and can take several minutes. Groq credentials and network access are needed for answer generation, vision extraction, and meeting summaries.

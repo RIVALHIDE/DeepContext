@@ -52,7 +52,8 @@ def initDB():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS documents (
                 document_id TEXT PRIMARY KEY,
-                source_name TEXT NOT NULL UNIQUE,
+                source_name TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT 'default',
                 current_version INTEGER NOT NULL DEFAULT 1,
                 chunk_ids TEXT NOT NULL DEFAULT '[]',
                 ingested_at TEXT,
@@ -61,6 +62,67 @@ def initDB():
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        cursor.execute("PRAGMA table_info(documents)")
+        document_columns = {row[1] for row in cursor.fetchall()}
+        if "workspace_id" not in document_columns:
+            cursor.execute("ALTER TABLE documents ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default'")
+        # Backfill registries created before workspace-aware document tracking.
+        # document_access is installed by auth and may not exist on the very
+        # first database initialization, hence the guarded lookup.
+        access_table = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='document_access'"
+        ).fetchone()
+        if access_table:
+            cursor.execute('''
+                UPDATE documents
+                SET workspace_id = COALESCE((
+                    SELECT da.workspace_id FROM document_access da
+                    WHERE da.source_name = documents.source_name
+                    LIMIT 1
+                ), workspace_id)
+                WHERE workspace_id = 'default'
+            ''')
+
+        # Remove the legacy global UNIQUE(source_name) constraint. A filename
+        # is unique only inside its workspace, not across the whole product.
+        legacy_global_unique = False
+        for index_row in cursor.execute("PRAGMA index_list(documents)").fetchall():
+            if not index_row[2]:
+                continue
+            columns = [row[2] for row in cursor.execute(
+                f"PRAGMA index_info('{index_row[1]}')"
+            ).fetchall()]
+            if columns == ["source_name"]:
+                legacy_global_unique = True
+                break
+        if legacy_global_unique:
+            cursor.executescript('''
+                ALTER TABLE documents RENAME TO documents_legacy;
+                CREATE TABLE documents (
+                    document_id TEXT PRIMARY KEY,
+                    source_name TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL DEFAULT 'default',
+                    current_version INTEGER NOT NULL DEFAULT 1,
+                    chunk_ids TEXT NOT NULL DEFAULT '[]',
+                    ingested_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(workspace_id, source_name)
+                );
+                INSERT OR REPLACE INTO documents(
+                    document_id, source_name, workspace_id, current_version,
+                    chunk_ids, ingested_at, status, created_at, updated_at
+                ) SELECT document_id, source_name, workspace_id, current_version,
+                         chunk_ids, ingested_at, status, created_at, updated_at
+                  FROM documents_legacy;
+                DROP TABLE documents_legacy;
+            ''')
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_workspace_source "
+            "ON documents(workspace_id, source_name)"
+        )
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS pending_uploads (

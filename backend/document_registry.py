@@ -35,38 +35,48 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return data
 
 
-def get_document(source_name: str) -> dict | None:
+def _workspace(workspace_id: str) -> str:
+    value = str(workspace_id or "").strip()
+    if not value:
+        raise ValueError("workspace_id is required for document registry access")
+    return value
+
+
+def get_document(source_name: str, workspace_id: str) -> dict | None:
     normalized = normalize_source_name(source_name)
+    workspace_id = _workspace(workspace_id)
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT * FROM documents WHERE source_name = ?",
-            (normalized,),
+            "SELECT * FROM documents WHERE source_name = ? AND workspace_id = ?",
+            (normalized, workspace_id),
         ).fetchone()
         return _row_to_dict(row)
     finally:
         conn.close()
 
 
-def list_documents() -> list[dict]:
+def list_documents(workspace_id: str) -> list[dict]:
+    workspace_id = _workspace(workspace_id)
     conn = _connect()
     try:
         rows = conn.execute(
             """
             SELECT *
             FROM documents
-            WHERE status = 'active'
+            WHERE status = 'active' AND workspace_id = ?
             ORDER BY updated_at DESC, source_name ASC
-            """
+            """,
+            (workspace_id,),
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
     finally:
         conn.close()
 
 
-def prepare_supersede(source_name: str) -> tuple[str, int]:
+def prepare_supersede(source_name: str, workspace_id: str) -> tuple[str, int]:
     normalized = normalize_source_name(source_name)
-    existing = get_document(normalized)
+    existing = get_document(normalized, workspace_id)
     if existing:
         return existing["document_id"], int(existing["current_version"]) + 1
     return str(uuid.uuid4()), 1
@@ -76,12 +86,14 @@ def upsert_document(
     *,
     document_id: str,
     source_name: str,
+    workspace_id: str,
     current_version: int,
     chunk_ids: list[str],
     ingested_at: str,
     status: str = "active",
 ) -> dict:
     normalized = normalize_source_name(source_name)
+    workspace_id = _workspace(workspace_id)
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     conn = _connect()
     try:
@@ -90,14 +102,15 @@ def upsert_document(
             INSERT INTO documents (
                 document_id,
                 source_name,
+                workspace_id,
                 current_version,
                 chunk_ids,
                 ingested_at,
                 status,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_name) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id, source_name) DO UPDATE SET
                 document_id = excluded.document_id,
                 current_version = excluded.current_version,
                 chunk_ids = excluded.chunk_ids,
@@ -108,6 +121,7 @@ def upsert_document(
             (
                 document_id,
                 normalized,
+                workspace_id,
                 current_version,
                 json.dumps(chunk_ids),
                 ingested_at,
@@ -117,18 +131,19 @@ def upsert_document(
             ),
         )
         conn.commit()
-        return get_document(normalized)
+        return get_document(normalized, workspace_id)
     finally:
         conn.close()
 
 
-def delete_document_record(source_name: str) -> bool:
+def delete_document_record(source_name: str, workspace_id: str) -> bool:
     normalized = normalize_source_name(source_name)
+    workspace_id = _workspace(workspace_id)
     conn = _connect()
     try:
         cursor = conn.execute(
-            "DELETE FROM documents WHERE source_name = ?",
-            (normalized,),
+            "DELETE FROM documents WHERE source_name = ? AND workspace_id = ?",
+            (normalized, workspace_id),
         )
         conn.commit()
         return cursor.rowcount > 0
@@ -136,9 +151,12 @@ def delete_document_record(source_name: str) -> bool:
         conn.close()
 
 
-def collect_chunk_ids_from_chroma(vector_db, source_name: str) -> list[str]:
+def collect_chunk_ids_from_chroma(vector_db, source_name: str, workspace_id: str) -> list[str]:
     normalized = normalize_source_name(source_name)
-    data = vector_db.get()
+    workspace_id = _workspace(workspace_id)
+    data = vector_db.get(where={"$and": [
+        {"team_id": workspace_id}, {"source_name": normalized},
+    ]})
     ids = data.get("ids", [])
     metadatas = data.get("metadatas", [])
 
@@ -147,16 +165,17 @@ def collect_chunk_ids_from_chroma(vector_db, source_name: str) -> list[str]:
         if not isinstance(metadata, dict):
             continue
         meta_name = normalize_source_name(metadata.get("source_name", ""))
-        if meta_name == normalized:
+        if meta_name == normalized and metadata.get("team_id") == workspace_id:
             matching_ids.append(doc_id)
     return matching_ids
 
 
-def delete_chunks_for_source(vector_db, source_name: str) -> int:
+def delete_chunks_for_source(vector_db, source_name: str, workspace_id: str) -> int:
     normalized = normalize_source_name(source_name)
-    registry_entry = get_document(normalized)
+    workspace_id = _workspace(workspace_id)
+    registry_entry = get_document(normalized, workspace_id)
     candidate_ids = set(registry_entry.get("chunk_ids", []) if registry_entry else [])
-    candidate_ids.update(collect_chunk_ids_from_chroma(vector_db, normalized))
+    candidate_ids.update(collect_chunk_ids_from_chroma(vector_db, normalized, workspace_id))
 
     if not candidate_ids:
         return 0
@@ -169,11 +188,15 @@ def collect_chunk_ids_for_version(
     vector_db,
     source_name: str,
     *,
+    workspace_id: str,
     version: int,
     ingested_at: str | None = None,
 ) -> list[str]:
     normalized = normalize_source_name(source_name)
-    data = vector_db.get()
+    workspace_id = _workspace(workspace_id)
+    data = vector_db.get(where={"$and": [
+        {"team_id": workspace_id}, {"source_name": normalized},
+    ]})
     ids = data.get("ids", [])
     metadatas = data.get("metadatas", [])
 
@@ -182,6 +205,8 @@ def collect_chunk_ids_for_version(
         if not isinstance(metadata, dict):
             continue
         if normalize_source_name(metadata.get("source_name", "")) != normalized:
+            continue
+        if metadata.get("team_id") != workspace_id:
             continue
         meta_version = metadata.get("version")
         try:
@@ -201,8 +226,8 @@ def migrate_legacy_duplicate_chunks(vector_db) -> dict:
     ids = data.get("ids", [])
     metadatas = data.get("metadatas", [])
 
-    grouped: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
-    display_names: dict[str, str] = {}
+    grouped: dict[tuple[str, str], dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    display_names: dict[tuple[str, str], str] = {}
 
     for doc_id, metadata in zip(ids, metadatas):
         if not isinstance(metadata, dict):
@@ -211,14 +236,16 @@ def migrate_legacy_duplicate_chunks(vector_db) -> dict:
         if not source_name:
             continue
         normalized = normalize_source_name(source_name)
+        workspace_id = str(metadata.get("team_id") or "default")
         ingested_at = metadata.get("ingested_at") or ""
-        grouped[normalized][ingested_at].append(doc_id)
-        display_names[normalized] = str(source_name)
+        key = (workspace_id, normalized)
+        grouped[key][ingested_at].append(doc_id)
+        display_names[key] = str(source_name)
 
     deleted_count = 0
     documents_processed = 0
 
-    for normalized, ingested_map in grouped.items():
+    for (workspace_id, normalized), ingested_map in grouped.items():
         sorted_ingested = sorted(ingested_map.keys(), reverse=True)
         latest_ingested_at = sorted_ingested[0]
         keep_ids = ingested_map[latest_ingested_at]
@@ -232,13 +259,14 @@ def migrate_legacy_duplicate_chunks(vector_db) -> dict:
             vector_db.delete(ids=stale_ids)
             deleted_count += len(stale_ids)
 
-        existing = get_document(normalized)
+        existing = get_document(normalized, workspace_id)
         document_id = existing["document_id"] if existing else str(uuid.uuid4())
         current_version = int(existing["current_version"]) if existing else max(len(sorted_ingested), 1)
 
         upsert_document(
             document_id=document_id,
-            source_name=display_names.get(normalized, normalized),
+            source_name=display_names.get((workspace_id, normalized), normalized),
+            workspace_id=workspace_id,
             current_version=current_version,
             chunk_ids=keep_ids,
             ingested_at=latest_ingested_at,

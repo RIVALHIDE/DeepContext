@@ -52,12 +52,32 @@ def init_auth():
           token_hash TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, email TEXT NOT NULL,
           role TEXT NOT NULL, expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS document_access (
-          source_name TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, access_level INTEGER NOT NULL);
+          source_name TEXT NOT NULL, workspace_id TEXT NOT NULL, access_level REAL NOT NULL,
+          PRIMARY KEY(workspace_id, source_name));
         CREATE TABLE IF NOT EXISTS login_attempts (key TEXT NOT NULL, attempted INTEGER NOT NULL);
         ''')
         columns = {row[1] for row in db.execute('PRAGMA table_info(pending_uploads)')}
         if 'access_level' not in columns:
             db.execute('ALTER TABLE pending_uploads ADD COLUMN access_level INTEGER NOT NULL DEFAULT 0')
+
+        # Older installations keyed document access by source_name alone.
+        # Rebuild it with a composite workspace key so identical filenames can
+        # safely exist in separate workspaces even without filename prefixes.
+        access_info = list(db.execute('PRAGMA table_info(document_access)'))
+        primary_key = [row[1] for row in sorted(access_info, key=lambda row: row[5]) if row[5]]
+        if primary_key != ['workspace_id', 'source_name']:
+            db.executescript('''
+                ALTER TABLE document_access RENAME TO document_access_legacy;
+                CREATE TABLE document_access (
+                  source_name TEXT NOT NULL,
+                  workspace_id TEXT NOT NULL,
+                  access_level REAL NOT NULL,
+                  PRIMARY KEY(workspace_id, source_name));
+                INSERT OR REPLACE INTO document_access(source_name, workspace_id, access_level)
+                  SELECT source_name, workspace_id, access_level FROM document_access_legacy;
+                DROP TABLE document_access_legacy;
+            ''')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_document_access_workspace ON document_access(workspace_id)')
 
 
 def signing_key():

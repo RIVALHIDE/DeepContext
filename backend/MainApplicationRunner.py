@@ -364,7 +364,7 @@ def getAllDocuments():
         permitted = {row['source_name']: row['access_level'] for row in db.execute(
             'SELECT source_name, access_level FROM document_access WHERE workspace_id=? AND access_level<=?',
             (actor['workspace_id'], ROLES[actor['role']]))}
-    records = [record for record in list_documents() if record['source_name'] in permitted]
+    records = [record for record in list_documents(actor['workspace_id']) if record['source_name'] in permitted]
     return {'message': 'Success', 'files': [
         {'name': record['source_name'], 'displayName': record['source_name'].split('__', 1)[-1],
          'status': record['status'], 'time': record['ingested_at'], 'version': record['current_version'],
@@ -383,8 +383,8 @@ def deleteDocument(sourceName: str):
         raise HTTPException(404, 'Document not found')
     try:
         vector_db = engine.get_vector_db(refresh=True)
-        deleted_count = delete_chunks_for_source(vector_db, sourceName)
-        registry_deleted = delete_document_record(sourceName)
+        deleted_count = delete_chunks_for_source(vector_db, sourceName, actor['workspace_id'])
+        registry_deleted = delete_document_record(sourceName, actor['workspace_id'])
 
         if deleted_count == 0 and not registry_deleted:
             raise HTTPException(status_code=404, detail=f"Document not found: {sourceName}")

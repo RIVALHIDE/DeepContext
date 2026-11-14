@@ -17,9 +17,9 @@ class Supervisor:
         self.ingest = DataIngestor()
         self.meeting_ai = MeetingAgent() # Initialize once
 
-    def _supersede_existing_document(self, vector_db, file_name: str) -> tuple[str, int]:
-        deleted_count = delete_chunks_for_source(vector_db, file_name)
-        document_id, new_version = prepare_supersede(file_name)
+    def _supersede_existing_document(self, vector_db, file_name: str, workspace_id: str) -> tuple[str, int]:
+        deleted_count = delete_chunks_for_source(vector_db, file_name, workspace_id)
+        document_id, new_version = prepare_supersede(file_name, workspace_id)
         if deleted_count:
             print(
                 f"♻️ [VERSION] Superseded {file_name} | deleted_chunks={deleted_count} | "
@@ -36,16 +36,19 @@ class Supervisor:
         document_id: str,
         version: int,
         ingested_at: str,
+        workspace_id: str,
     ) -> list[str]:
         chunk_ids = collect_chunk_ids_for_version(
             vector_db,
             file_name,
+            workspace_id=workspace_id,
             version=version,
             ingested_at=ingested_at,
         )
         upsert_document(
             document_id=document_id,
             source_name=file_name,
+            workspace_id=workspace_id,
             current_version=version,
             chunk_ids=chunk_ids,
             ingested_at=ingested_at,
@@ -76,7 +79,7 @@ class Supervisor:
                 )
             
             summary_report = self.meeting_ai.analyze_transcript_text(full_text)
-            document_id, version = self._supersede_existing_document(vector_db, file_name)
+            document_id, version = self._supersede_existing_document(vector_db, file_name, team_id)
 
             if job_id:
                 publish(
@@ -107,6 +110,7 @@ class Supervisor:
                 document_id,
                 version,
                 ingested_at,
+                team_id,
             )
             print(
                 f"📦 [WRITE] Meeting summary stored | version={version} | chunks={len(chunk_ids)} | "
@@ -122,7 +126,7 @@ class Supervisor:
             if not new_chunks:
                 raise RuntimeError(f"No content extracted from file: {file_name}")
 
-            document_id, version = self._supersede_existing_document(vector_db, file_name)
+            document_id, version = self._supersede_existing_document(vector_db, file_name, team_id)
 
             batch_size = 20  
             processed_chunks = []
@@ -158,6 +162,7 @@ class Supervisor:
                 document_id,
                 version,
                 ingested_at,
+                team_id,
             )
             print(
                 f"📦 [WRITE] Audit chunks stored | version={version} | chunks_written={len(chunk_ids)} | "

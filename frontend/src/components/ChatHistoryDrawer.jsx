@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Clock, ExternalLink, FileCheck2, MessageSquarePlus, ShieldCheck, UploadCloud, Video, X } from 'lucide-react';
+import { Clock, FileCheck2, MessageSquarePlus, ShieldCheck, UploadCloud, Video, X } from 'lucide-react';
 import api from '../utils/api.util';
 import {
   STAGE_LABELS,
@@ -7,6 +7,7 @@ import {
 } from '../utils/ingestProgress.util';
 import { ensureInitialChatSession, getChatSessions } from '../utils/chatSessions.util';
 import ConfirmModal from './ui/ConfirmModal';
+import NexconnHuddle from './NexconnHuddle';
 
 function formatTime(iso) {
   if (!iso) return '';
@@ -41,7 +42,6 @@ export default function ChatHistoryDrawer({
   const [huddleOpen, setHuddleOpen] = useState(false);
   const canUpload = ['member', 'editor', 'admin', 'owner'].includes(user?.role);
   const canSelfApprove = ['editor', 'admin', 'owner'].includes(user?.role);
-  const huddleUrl = import.meta.env.VITE_NEXCONN_HUDDLE_URL;
 
   const username = user?.username ?? null;
 
@@ -297,17 +297,7 @@ export default function ChatHistoryDrawer({
         </div>
       )}
 
-      {huddleOpen && (
-        <div className="fixed inset-0 z-[100] grid place-items-center p-5" style={{ background: 'rgba(15,23,42,.36)', backdropFilter: 'blur(5px)' }} onClick={() => setHuddleOpen(false)}>
-          <section className="w-full max-w-sm rounded-2xl p-5 text-center" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border)', boxShadow: '0 24px 70px rgba(15,23,42,.22)' }} onClick={(event) => event.stopPropagation()}>
-            <span className="mx-auto w-12 h-12 rounded-2xl flex items-center justify-center" style={{ color: '#08784f', background: 'rgba(16,185,129,.14)', border: '1px solid rgba(16,185,129,.25)' }}><Video size={22} /></span>
-            <h2 className="text-base font-semibold mt-3">Nexconn Huddle</h2>
-            <p className="text-xs mt-2 leading-relaxed" style={{ color: 'var(--dc-text-muted)' }}>{huddleUrl ? 'Open the configured audio room for this workspace.' : 'The Huddle launcher is ready. Configure your Nexconn Call room URL to enable live audio.'}</p>
-            {!huddleUrl && <code className="block text-[10px] rounded-lg px-2 py-2 mt-3" style={{ background: 'var(--dc-surface-1)', color: 'var(--dc-brand)', border: '1px solid var(--dc-border)' }}>VITE_NEXCONN_HUDDLE_URL=https://…</code>}
-            <div className="flex gap-2 mt-5"><button type="button" onClick={() => setHuddleOpen(false)} className="flex-1 px-4 py-2 rounded-lg text-xs" style={{ border: '1px solid var(--dc-border)' }}>Close</button><button type="button" disabled={!huddleUrl} onClick={() => window.open(`${huddleUrl}?workspace=${encodeURIComponent(user.workspace_id)}`, '_blank', 'noopener,noreferrer')} className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold disabled:opacity-40" style={{ background: 'var(--dc-green)', color: 'white' }}>Join huddle <ExternalLink size={12} /></button></div>
-          </section>
-        </div>
-      )}
+      {huddleOpen && <NexconnHuddle onClose={() => setHuddleOpen(false)} />}
 
       {isOpen && (
         <div

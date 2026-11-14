@@ -75,7 +75,7 @@ class WorkspaceAPITests(unittest.TestCase):
         workspace = self.identity['workspace_id']
         with auth.connect() as db:
             for source, workspace_id, level in [('alpha-public.md', workspace, 0), ('alpha-secret.md', workspace, 2), ('beta.md', 'different-workspace', 0), ('legacy.md', 'default', 0)]:
-                db.execute('INSERT INTO documents (document_id, source_name) VALUES (?, ?)', (source, source))
+                db.execute('INSERT INTO documents (document_id, source_name, workspace_id) VALUES (?, ?, ?)', (source, source, workspace_id))
                 db.execute('INSERT INTO document_access VALUES (?, ?, ?)', (source, workspace_id, level))
         viewer = self.member_client()
         self.assertEqual([doc['name'] for doc in viewer.get('/retriveAllDocuments').json()['files']], ['alpha-public.md'])

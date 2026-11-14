@@ -10,7 +10,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@nexconn/chat": "^26.2.1",
+    "@nexconn/call": "26.2.1",
+    "@nexconn/chat": "26.2.0",
+    "@nexconn/engine": "26.2.0",
     "@tailwindcss/vite": "^4.2.0",
     "@xyflow/react": "^12.5.0",
     "axios": "^1.13.5",

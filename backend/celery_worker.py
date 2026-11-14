@@ -77,7 +77,10 @@ def process_document_task(self, file_source: str, is_slack_upload: bool = False,
         supervisor = Supervisor()
         supervisor.supervisor(file_to_process, job_id=job_id, team_id=team_id, access_level=access_level)
         with sqlite3.connect(DB_PATH) as database:
-            database.execute('INSERT OR REPLACE INTO document_access VALUES (?, ?, ?)',
+            database.execute('''INSERT INTO document_access(source_name, workspace_id, access_level)
+                                VALUES (?, ?, ?)
+                                ON CONFLICT(workspace_id, source_name)
+                                DO UPDATE SET access_level=excluded.access_level''',
                              (os.path.basename(file_to_process).casefold(), team_id, access_level))
         publish(job_id, "completed", "Ingestion complete", file_name=os.path.basename(file_to_process))
         return "Ingestion Complete"
