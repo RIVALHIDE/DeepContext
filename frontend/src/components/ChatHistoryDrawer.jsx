@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Clock, FileCheck2, MessageSquarePlus, ShieldCheck, UploadCloud, Video, X } from 'lucide-react';
 import api from '../utils/api.util';
 import {
@@ -52,6 +52,14 @@ export default function ChatHistoryDrawer({
 
   const username = user?.username ?? null;
 
+  const openUploadModal = useCallback(() => {
+    if (!canUpload || isUploading) return;
+    setUploadError('');
+    setSelectedFiles([]);
+    setBatchRows([]);
+    setUploadOpen(true);
+  }, [canUpload, isUploading]);
+
   const sortedSessions = useMemo(() => {
     const arr = Array.isArray(sessions) ? [...sessions] : [];
     arr.sort((a, b) => {
@@ -70,6 +78,12 @@ export default function ChatHistoryDrawer({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [isOpen]);
+
+  useEffect(() => {
+    const openFromComposer = () => openUploadModal();
+    window.addEventListener('deepcontext-open-upload', openFromComposer);
+    return () => window.removeEventListener('deepcontext-open-upload', openFromComposer);
+  }, [openUploadModal]);
 
   useEffect(() => {
     if (!username) return;
@@ -297,7 +311,7 @@ export default function ChatHistoryDrawer({
 
       {canUpload && <button
         type="button"
-        onClick={() => { setUploadError(''); setSelectedFiles([]); setBatchRows([]); setUploadOpen(true); }}
+        onClick={openUploadModal}
         disabled={isUploading}
         className="inline-flex items-center gap-2 text-xs border rounded-xl px-3 py-2 transition disabled:opacity-50"
         style={{ color: 'var(--dc-text-secondary)', background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)', cursor: isUploading ? 'not-allowed' : 'pointer' }}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, AtSign, BookPlus, Download, FileText, LoaderCircle, Paperclip, Send, Users, X } from 'lucide-react';
+import { AlertCircle, AtSign, BookPlus, Check, Download, FileText, LoaderCircle, Paperclip, Pencil, Send, Users, X } from 'lucide-react';
 import api from '../utils/api.util';
 import { connectNexconn, NEXCONN_TYPING_MESSAGE, nexconnResultError } from '../utils/nexconnClient.util';
 import { MAX_KNOWLEDGE_FILE_BYTES, knowledgeFileError } from '../utils/uploadFormats.util';
@@ -8,6 +8,7 @@ import ChatWindow from './ChatWindow';
 
 function DeepContextChat({
   user,
+  docs,
   ingestState,
   onIngestStart,
   onIngestEvent,
@@ -19,6 +20,7 @@ function DeepContextChat({
   return <div className="flex flex-col h-full">
     <ChatWindow
       user={user}
+      docs={docs}
       ingestState={ingestState}
       onIngestStart={onIngestStart}
       onIngestEvent={onIngestEvent}
@@ -64,6 +66,8 @@ function normalizeMessage(message, currentUser) {
     senderId: message.senderUserId,
     senderName: mine ? currentUser.name : (sender?.name || message.content?.senderName || message.senderUserId || 'Unknown user'),
     sentTime: message.sentTime || Date.now(),
+    channelIdentifier: message.channelIdentifier,
+    edited: Boolean(message.hasChanged || message.updateInfo),
     mentionedUserIds: message.content?.mentionedInfo?.userIdList || [],
     attachment: isFile ? {
       name: message.content?.name || 'Shared file',
@@ -111,6 +115,10 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
   const [mentionRange, setMentionRange] = useState(null);
   const [attachmentUpload, setAttachmentUpload] = useState(null);
   const [attachmentActions, setAttachmentActions] = useState({});
+  const [editingMessageId, setEditingMessageId] = useState(null);
+  const [editText, setEditText] = useState('');
+  const [editError, setEditError] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
   const channelRef = useRef(null);
   const sdkRef = useRef(null);
   const scrollRef = useRef(null);
@@ -215,6 +223,9 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
             const inChannel = received.filter((message) => sameChannel(message, data.channel));
             inChannel.filter((message) => message.messageType === NEXCONN_TYPING_MESSAGE).forEach(noteTyping);
             addMessages(inChannel.filter((message) => message.messageType !== NEXCONN_TYPING_MESSAGE));
+          },
+          onMessagesUpdated({ messages: updated }) {
+            addMessages((updated || []).filter((message) => sameChannel(message, data.channel)));
           },
         }));
 
@@ -356,6 +367,57 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
     }
   };
 
+  const startEditingMessage = (message) => {
+    setEditingMessageId(message.id);
+    setEditText(message.text || '');
+    setEditError('');
+  };
+
+  const cancelEditingMessage = () => {
+    setEditingMessageId(null);
+    setEditText('');
+    setEditError('');
+  };
+
+  const saveEditedMessage = async (event, message) => {
+    event.preventDefault();
+    const value = editText.trim();
+    if (!value || savingEdit || !sdkRef.current || !message?.channelIdentifier) return;
+    if (value === message.text.trim()) {
+      cancelEditingMessage();
+      return;
+    }
+
+    setSavingEdit(true);
+    setEditError('');
+    try {
+      const mentioned = members.filter((member) => member.provider_id !== session?.user_id
+        && value.toLowerCase().includes(`@${member.name.toLowerCase()}`));
+      const content = { text: value };
+      if (mentioned.length) {
+        content.mentionedInfo = {
+          type: sdkRef.current.MentionedType.USERS,
+          userIdList: mentioned.map((member) => member.provider_id),
+          mentionedContent: `${user?.name || user?.username || 'A workspace member'} mentioned you`,
+        };
+      }
+      const result = await sdkRef.current.BaseChannel.updateMessage({
+        channelIdentifier: message.channelIdentifier,
+        messageId: message.id,
+        content,
+      });
+      if (!result.isOk) throw new Error(resultError(result, 'Message could not be edited'));
+      setMessages((current) => current.map((item) => item.id === message.id
+        ? { ...item, text: value, edited: true, mentionedUserIds: mentioned.map((member) => member.provider_id) }
+        : item));
+      cancelEditingMessage();
+    } catch (error) {
+      setEditError(error.message || 'Message could not be edited. It may be outside Nexconn’s edit window.');
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
   const discardStagedShare = async (documentId) => {
     if (!documentId) return;
     try {
@@ -490,8 +552,9 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
       {!messages.length && <div className="h-full flex items-center justify-center text-sm" style={{ color: 'var(--dc-text-muted)' }}>No messages in this channel yet.</div>}
       {messages.map((message) => {
         const mine = message.senderId === session?.user_id;
+        const isEditing = editingMessageId === message.id;
         return <div key={message.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
-          <div className="max-w-[75%] rounded-2xl px-4 py-2.5" style={{ background: mine ? 'var(--dc-brand-dim)' : 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}>
+          <div className="group max-w-[75%] rounded-2xl px-4 py-2.5" style={{ background: mine ? 'var(--dc-brand-dim)' : 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}>
             <p className="text-[10px] font-semibold mb-1" style={{ color: mine ? 'var(--dc-text-secondary)' : 'var(--dc-brand)' }}>{mine ? `${message.senderName} · You` : message.senderName}</p>
             {message.attachment ? <div className="min-w-[230px] max-w-sm rounded-xl p-3" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border-strong)' }}>
               <div className="flex items-center gap-2.5">
@@ -503,9 +566,39 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
                 {canAddAttachments ? <button type="button" onClick={() => addAttachmentToWorkspace(message.attachment)} disabled={Boolean(attachmentActions[message.attachment.documentId]) && attachmentActions[message.attachment.documentId].status !== 'failed'} className="w-full rounded-lg px-2.5 py-1.5 flex items-center justify-center gap-1.5 text-[10px] font-semibold disabled:opacity-60" style={{ color: 'var(--dc-green)', background: 'rgba(16,185,129,.10)', border: '1px solid rgba(16,185,129,.22)' }}><BookPlus size={13} />{attachmentActions[message.attachment.documentId]?.message || 'Add to workspace'}</button>
                   : <p className="text-[9px] flex items-center gap-1" style={{ color: 'var(--dc-text-muted)' }}><BookPlus size={11} />Waiting for an editor to add this to the workspace</p>}
               </div> : <p className="text-[9px] mt-2" style={{ color: 'var(--dc-text-muted)' }}>Chat attachment only · this format cannot be indexed</p>}
-            </div> : <p className="text-sm whitespace-pre-wrap break-words">{renderMessageText(message.text, members)}</p>}
+            </div> : isEditing ? (
+              <form onSubmit={(event) => saveEditedMessage(event, message)} className="min-w-[280px]">
+                <textarea
+                  autoFocus
+                  value={editText}
+                  onChange={(event) => setEditText(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape') {
+                      event.preventDefault();
+                      cancelEditingMessage();
+                    } else if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
+                      event.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                  rows={Math.min(5, Math.max(1, editText.split('\n').length))}
+                  maxLength={4096}
+                  className="block max-h-36 min-h-10 w-full resize-none bg-transparent text-sm outline-none"
+                  aria-label="Edit Nexconn message"
+                />
+                {editError ? <p className="mt-1 text-[10px]" style={{ color: 'var(--dc-red)' }}>{editError}</p> : null}
+                <div className="mt-2 flex items-center justify-end gap-1.5 border-t pt-2" style={{ borderColor: 'var(--dc-brand-border)' }}>
+                  <span className="mr-auto text-[9px]" style={{ color: 'var(--dc-text-muted)' }}>Enter to send</span>
+                  <button type="button" onClick={cancelEditingMessage} className="flex h-7 w-7 items-center justify-center rounded-lg" aria-label="Cancel editing"><X size={13} /></button>
+                  <button type="submit" disabled={savingEdit || !editText.trim()} className="flex h-7 w-7 items-center justify-center rounded-lg disabled:opacity-40" style={{ background: 'var(--dc-brand)', color: 'white' }} aria-label="Send edited message"><Check size={13} /></button>
+                </div>
+              </form>
+            ) : <p className="text-sm whitespace-pre-wrap break-words">{renderMessageText(message.text, members)}</p>}
             {message.mentionedUserIds.includes(session?.user_id) && <span className="inline-flex items-center gap-1 mt-1 text-[9px] font-semibold" style={{ color: 'var(--dc-brand)' }}><AtSign size={10} />Mentioned you</span>}
-            <p className="text-[9px] text-right mt-1" style={{ color: 'var(--dc-text-muted)' }}>{new Date(message.sentTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+            {!isEditing && <div className="mt-1 flex items-center justify-end gap-2">
+              {mine && !message.attachment ? <button type="button" onClick={() => startEditingMessage(message)} disabled={savingEdit || Boolean(editingMessageId)} className="flex items-center gap-1 text-[9px] opacity-0 transition group-hover:opacity-100 focus:opacity-100 disabled:opacity-30" style={{ color: 'var(--dc-text-muted)' }} aria-label="Edit Nexconn message"><Pencil size={10} />Edit</button> : null}
+              <p className="text-[9px]" style={{ color: 'var(--dc-text-muted)' }}>{message.edited ? 'edited · ' : ''}{new Date(message.sentTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+            </div>}
           </div>
         </div>;
       })}

@@ -297,6 +297,7 @@ class RAGState(TypedDict):
     question: str
     standalone_question: str
     user_team: str
+    selected_sources: List[str]
     chat_history: List
     intent: str               # "small_talk" | "question" | "diagram" | "no_docs"
     retrieved_docs: List
@@ -508,6 +509,7 @@ class DeepContextEngine:
         query: str,
         candidate_k: int | None = None,
         team_id: str = None,
+        source_names: List[str] | None = None,
     ) -> List[Document]:
         """
         First-stage hybrid retrieval: semantic + BM25 fused with RRF.
@@ -524,7 +526,7 @@ class DeepContextEngine:
         distance_max = settings["semantic_distance_max"]
 
         # RBAC filter: only restrict when a non-default team is specified
-        chroma_filter = retrieval_filter(team_id)
+        chroma_filter = retrieval_filter(team_id, source_names)
 
         semantic_results = self.vector_db.similarity_search_with_score(
             query, k=semantic_k, filter=chroma_filter
@@ -575,6 +577,33 @@ class DeepContextEngine:
 
         ranked_keys = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
         candidates = [doc_store[key] for key in ranked_keys if key in doc_store]
+        if not candidates and source_names:
+            # An explicit @file selection is itself strong retrieval intent.
+            # Broad prompts such as "summarize this" can miss the semantic
+            # distance threshold, so let the reranker inspect selected chunks.
+            grouped: dict[str, list[Document]] = {}
+            for text, meta in zip(all_texts, all_metadatas):
+                grouped.setdefault(str(meta.get("source_name", "")), []).append(
+                    Document(page_content=text, metadata=meta)
+                )
+            candidates = []
+            offset = 0
+            while len(candidates) < candidate_k:
+                added = False
+                for source in source_names:
+                    chunks = grouped.get(str(source).casefold(), [])
+                    if offset < len(chunks):
+                        candidates.append(chunks[offset])
+                        added = True
+                        if len(candidates) >= candidate_k:
+                            break
+                if not added:
+                    break
+                offset += 1
+            print(
+                f"📎 Explicit file fallback | sources={len(source_names)} | "
+                f"candidates={len(candidates)}"
+            )
         print(
             f"🔎 Hybrid candidates | semantic={len(semantic_docs)} | "
             f"bm25_hits={sum(1 for i in top_bm25_idx if bm25_scores[i] > 0)} | "
@@ -596,11 +625,12 @@ class DeepContextEngine:
         ranked_docs: List[Document],
         k: int,
         team_id: str = None,
+        source_names: List[str] | None = None,
     ):
         if not ranked_docs:
             return [], set()
 
-        chroma_filter = retrieval_filter(team_id)
+        chroma_filter = retrieval_filter(team_id, source_names)
         all_dept_data = (
             self.vector_db.get(where=chroma_filter) if chroma_filter
             else self.vector_db.get()
@@ -729,13 +759,13 @@ class DeepContextEngine:
 
         return final[:k], primary_source_names
     
-    def _retrieve_documents(self, query: str, top_k: int | None = None, team_id: str = None):
-        return self._hybrid_search(query, k=top_k or self._retrieval_settings()["top_k"], team_id=team_id)
+    def _retrieve_documents(self, query: str, top_k: int | None = None, team_id: str = None, source_names: List[str] | None = None):
+        return self._hybrid_search(query, k=top_k or self._retrieval_settings()["top_k"], team_id=team_id, source_names=source_names)
 
-    def _hybrid_search(self, query: str, k: int = 5, team_id: str = None):
+    def _hybrid_search(self, query: str, k: int = 5, team_id: str = None, source_names: List[str] | None = None):
         settings = self._retrieval_settings()
         candidate_k = settings["candidate_k"] if self.reranker.enabled else k
-        candidates = self._hybrid_search_candidates(query, candidate_k=candidate_k, team_id=team_id)
+        candidates = self._hybrid_search_candidates(query, candidate_k=candidate_k, team_id=team_id, source_names=source_names)
         if not candidates:
             return [], set()
 
@@ -757,7 +787,7 @@ class DeepContextEngine:
             reranked = candidates[:k]
             print(f"🎯 Rerank disabled | candidates={len(candidates)} | top_k={k}")
 
-        return self._expand_sibling_chunks(reranked, k=k, team_id=team_id)
+        return self._expand_sibling_chunks(reranked, k=k, team_id=team_id, source_names=source_names)
 
     def _create_vector_db(self):
         """Create a Chroma handle backed by the shared Chroma HTTP server."""
@@ -880,7 +910,7 @@ class DeepContextEngine:
             print(f"⚠️ Contextualize step failed ({e}), falling back to original question.")
             return user_question
 
-    def _build_answer_request(self, user_question: str, chat_history: List = None, team_id: str = None) -> dict:
+    def _build_answer_request(self, user_question: str, chat_history: List = None, team_id: str = None, selected_sources: List[str] | None = None) -> dict:
         small_talk_intent = _detect_small_talk_intent(user_question)
         if small_talk_intent:
             return {
@@ -895,7 +925,7 @@ class DeepContextEngine:
         # Step 1: Reload Chroma to pick up freshly ingested docs
         vector_db = self.get_vector_db(refresh=True)
 
-        visible_snapshot = vector_db.get(where=retrieval_filter(team_id))
+        visible_snapshot = vector_db.get(where=retrieval_filter(team_id, selected_sources))
         visible_count = len(visible_snapshot.get("documents", []))
         visible_sources = sorted({
             metadata.get("source_name")
@@ -915,13 +945,13 @@ class DeepContextEngine:
             f"used_history={bool(safe_history)}"
         )
 
-        valid_docs, primary_sources = self._retrieve_documents(retrieval_query, team_id=team_id)
+        valid_docs, primary_sources = self._retrieve_documents(retrieval_query, team_id=team_id, source_names=selected_sources)
         if (
             not valid_docs
             and retrieval_query.strip().casefold() != user_question.strip().casefold()
         ):
             print(f"⚠️ No hits for standalone query; falling back to raw question retrieval. standalone_q={retrieval_query}")
-            valid_docs, primary_sources = self._retrieve_documents(user_question, team_id=team_id)
+            valid_docs, primary_sources = self._retrieve_documents(user_question, team_id=team_id, source_names=selected_sources)
 
         if not valid_docs:
             return {
@@ -1142,6 +1172,7 @@ class DeepContextEngine:
         """Retrieve documents from ChromaDB with RBAC filter (team_id)."""
         question = state["question"]
         team_id = state.get("user_team")
+        selected_sources = state.get("selected_sources", [])
         chat_history = state.get("chat_history", [])
 
         vector_db = self.get_vector_db(refresh=True)
@@ -1151,13 +1182,13 @@ class DeepContextEngine:
         retrieval_query = standalone_q.strip() or question
         state["standalone_question"] = standalone_q
 
-        valid_docs, primary_sources = self._retrieve_documents(retrieval_query, team_id=team_id)
+        valid_docs, primary_sources = self._retrieve_documents(retrieval_query, team_id=team_id, source_names=selected_sources)
 
         if (
             not valid_docs
             and retrieval_query.strip().casefold() != question.strip().casefold()
         ):
-            valid_docs, primary_sources = self._retrieve_documents(question, team_id=team_id)
+            valid_docs, primary_sources = self._retrieve_documents(question, team_id=team_id, source_names=selected_sources)
 
         if not valid_docs:
             state["intent"] = "no_docs"
@@ -1351,6 +1382,7 @@ class DeepContextEngine:
         question: str,
         user_team: str = None,
         chat_history: List = None,
+        selected_sources: List[str] | None = None,
     ) -> dict:
         """Run the LangGraph RAG workflow and return the result dict."""
         if not hasattr(self, "_compiled_workflow"):
@@ -1360,6 +1392,7 @@ class DeepContextEngine:
             "question": question,
             "standalone_question": "",
             "user_team": user_team or "default",
+            "selected_sources": selected_sources or [],
             "chat_history": chat_history or [],
             "intent": "",
             "retrieved_docs": [],
@@ -1390,6 +1423,6 @@ class DeepContextEngine:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def get_answer(self, user_question: str, chat_history: List = None, user_team: str = None):
+    def get_answer(self, user_question: str, chat_history: List = None, user_team: str = None, selected_sources: List[str] | None = None):
         """Run the LangGraph RAG workflow with reflection loop."""
-        return self.run_workflow(user_question, user_team=user_team, chat_history=chat_history)
+        return self.run_workflow(user_question, user_team=user_team, chat_history=chat_history, selected_sources=selected_sources)

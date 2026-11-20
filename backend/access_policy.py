@@ -38,8 +38,8 @@ QUERY_CLEARANCE_RULES = (
 )
 
 
-def retrieval_filter(scope):
-    """Every retrieval must restrict both workspace and minimum document role."""
+def retrieval_filter(scope, source_names=None):
+    """Restrict retrieval by workspace, clearance, and optional explicit files."""
     workspace, separator, level = str(scope or '').partition('|')
     try:
         parsed_level = float(level)
@@ -48,7 +48,15 @@ def retrieval_filter(scope):
     if not workspace or not separator or parsed_level not in ROLES.values():
         raise ValueError('An authenticated workspace retrieval scope is required')
     normalized_level = int(parsed_level) if parsed_level.is_integer() else parsed_level
-    return {'$and': [{'team_id': workspace}, {'access_level': {'$lte': normalized_level}}]}
+    filters = [{'team_id': workspace}, {'access_level': {'$lte': normalized_level}}]
+    selected = list(dict.fromkeys(
+        str(source_name).strip().casefold()
+        for source_name in (source_names or [])
+        if str(source_name).strip()
+    ))
+    if selected:
+        filters.append({'source_name': {'$in': selected}})
+    return {'$and': filters}
 
 
 def query_clearance(question, role):

@@ -21,7 +21,7 @@ from auth import (install_auth, current, require_role, session_owner, retrieval_
                   connect as auth_connect, ROLES)
 from office_loader import OFFICE_EXTENSIONS
 from access_policy import query_clearance
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ingest_progress import get_latest, subscribe
 from chroma_health import check_chroma_health, log_chroma_config
@@ -106,6 +106,48 @@ class UserRequest(BaseModel):
     question:str
     sessionId:str
     userTeam:str = "default"
+    selectedSources: list[str] = Field(default_factory=list, max_length=10)
+    replaceHumanTurn: int | None = Field(default=None, ge=0)
+
+
+def _apply_chat_branch(request: UserRequest):
+    """Make edits and retries replace an existing turn instead of duplicating it."""
+    if request.replaceHumanTurn is not None:
+        history_manager.truncate_from_human_turn(
+            request.sessionId,
+            request.replaceHumanTurn,
+        )
+
+
+def _validated_selected_sources(requested_sources: list[str], actor: dict) -> list[str]:
+    """Resolve explicitly selected files against the caller's RBAC scope."""
+    requested = list(dict.fromkeys(
+        str(source).strip().casefold()
+        for source in (requested_sources or [])
+        if str(source).strip()
+    ))
+    if not requested:
+        return []
+
+    with auth_connect() as db:
+        rows = db.execute(
+            '''SELECT source_name FROM document_access
+               WHERE workspace_id=? AND access_level<=?''',
+            (actor['workspace_id'], ROLES[actor['role']]),
+        ).fetchall()
+    permitted = {str(row['source_name']).casefold(): str(row['source_name']) for row in rows}
+    unavailable = [source for source in requested if source not in permitted]
+    if unavailable:
+        raise HTTPException(403, 'One or more tagged files are unavailable at your access level.')
+    return [permitted[source] for source in requested]
+
+
+def _retrieval_question(question: str, selected_sources: list[str]) -> str:
+    if not selected_sources:
+        return question
+    cleaned = re.sub(r'@\[[^\]]+\]', ' ', str(question or ''))
+    cleaned = ' '.join(cleaned.split())
+    return cleaned or 'Summarize the selected documents.'
 
 
 class ChatSessionCreateRequest(BaseModel):
@@ -629,8 +671,11 @@ def get_answer(question: UserRequest):
     authorize_session(question.sessionId, allow_new=True)
     question.userTeam = retrieval_scope()
     actor = current()
+    selected_sources = _validated_selected_sources(question.selectedSources, actor)
+    retrieval_question = _retrieval_question(question.question, selected_sources)
     username = session_owner()
     session_manager.ensure_session(username, question.sessionId)
+    _apply_chat_branch(question)
     history = visible_history(question.sessionId)
     clearance = query_clearance(question.question, actor['role'])
     if not clearance['allowed']:
@@ -654,7 +699,12 @@ def get_answer(question: UserRequest):
                 "current_role": actor['role'],
             },
         }
-    result = engine.get_answer(question.question, history, user_team=question.userTeam)
+    result = engine.get_answer(
+        retrieval_question,
+        history,
+        user_team=question.userTeam,
+        selected_sources=selected_sources,
+    )
 
     answer_text = result["answer"]
     diagrams = result.get("diagrams",[])
@@ -702,8 +752,11 @@ async def get_answer_stream(question: UserRequest):
     authorize_session(question.sessionId, allow_new=True)
     question.userTeam = retrieval_scope()
     actor = current()
+    selected_sources = _validated_selected_sources(question.selectedSources, actor)
+    retrieval_question = _retrieval_question(question.question, selected_sources)
     username = session_owner()
     session_manager.ensure_session(username, question.sessionId)
+    _apply_chat_branch(question)
     history = visible_history(question.sessionId)
     clearance = query_clearance(question.question, actor['role'])
 
@@ -758,7 +811,12 @@ async def get_answer_stream(question: UserRequest):
         loop = asyncio.get_event_loop()
         prepared = await loop.run_in_executor(
             None,
-            lambda: engine._build_answer_request(question.question, history, team_id=question.userTeam)
+            lambda: engine._build_answer_request(
+                retrieval_question,
+                history,
+                team_id=question.userTeam,
+                selected_sources=selected_sources,
+            )
         )
 
         mode = prepared.get("mode")
@@ -822,7 +880,12 @@ async def get_answer_stream(question: UserRequest):
             })
             fallback = await loop.run_in_executor(
                 None,
-                lambda: engine.get_answer(question.question, history, user_team=question.userTeam)
+                lambda: engine.get_answer(
+                    retrieval_question,
+                    history,
+                    user_team=question.userTeam,
+                    selected_sources=selected_sources,
+                )
             )
             answer_text = fallback.get("answer", "")
             diagrams = fallback.get("diagrams", [])
@@ -859,7 +922,12 @@ async def get_answer_stream(question: UserRequest):
         if not reflection_state.get("reflection_passed", True):
             corrected = await loop.run_in_executor(
                 None,
-                lambda: engine.get_answer(question.question, history, user_team=question.userTeam),
+                lambda: engine.get_answer(
+                    retrieval_question,
+                    history,
+                    user_team=question.userTeam,
+                    selected_sources=selected_sources,
+                ),
             )
             answer_text = corrected.get("answer", answer_text)
             diagrams = corrected.get("diagrams", diagrams)

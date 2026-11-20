@@ -36,7 +36,7 @@ class ChatHistroyManager:
         self._ensure_extra_columns(cursor)
 
         cursor.execute(
-            "SELECT role, content, diagrams, sources FROM chat_history WHERE session_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
+            "SELECT id, role, content, diagrams, sources FROM chat_history WHERE session_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
             (sessionId, limit,)
         )
 
@@ -44,7 +44,7 @@ class ChatHistroyManager:
         conn.close()
 
         history = []
-        for role, content, diagrams_raw, sources_raw in reversed(result):
+        for history_id, role, content, diagrams_raw, sources_raw in reversed(result):
             parsed_diagrams = []
             if diagrams_raw:
                 try:
@@ -60,6 +60,7 @@ class ChatHistroyManager:
                     parsed_sources = []
 
             entry = {
+                "id": history_id,
                 "role": role,
                 "content": content,
                 "diagrams": parsed_diagrams if role == "ai" else [],
@@ -70,6 +71,30 @@ class ChatHistroyManager:
             history.append(entry)
 
         return history
+
+    def truncate_from_human_turn(self, sessionId: str, human_turn: int):
+        """Remove a human turn and everything after it for edit/retry branching."""
+        if human_turn < 0:
+            raise ValueError("human_turn must be non-negative")
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        row = cursor.execute(
+            """
+            SELECT id FROM chat_history
+            WHERE session_id = ? AND role = 'human'
+            ORDER BY id ASC
+            LIMIT 1 OFFSET ?
+            """,
+            (sessionId, human_turn),
+        ).fetchone()
+        if row:
+            cursor.execute(
+                "DELETE FROM chat_history WHERE session_id = ? AND id >= ?",
+                (sessionId, row[0]),
+            )
+            conn.commit()
+        conn.close()
     
     def deleteChatBySession(self,sessionId:str):
         conn = sqlite3.connect(DB_PATH)

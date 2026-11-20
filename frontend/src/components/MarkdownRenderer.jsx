@@ -27,7 +27,7 @@ function renderWithCitations(text, onHover, onLeave, highlightedIndex) {
   });
 }
 
-export default function MarkdownRenderer({ content, diagrams = [], sources = [] }) {
+export default function MarkdownRenderer({ content, diagrams = [], sources = [], documents = [] }) {
   const { highlightedIndex, onHover, onLeave } = useCitationHighlight();
 
   // Models sometimes put HTML-style breaks inside Markdown table cells.
@@ -78,7 +78,7 @@ export default function MarkdownRenderer({ content, diagrams = [], sources = [] 
 
       <DiagramRenderer diagrams={diagrams} />
 
-      <SourcePanel sources={sources} highlightedIndex={highlightedIndex} />
+      <SourcePanel sources={sources} documents={documents} highlightedIndex={highlightedIndex} />
     </div>
   );
 }

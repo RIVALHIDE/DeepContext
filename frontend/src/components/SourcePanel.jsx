@@ -1,9 +1,10 @@
 import React from 'react';
 import { FileText } from 'lucide-react';
-import { sourceDisplayName } from '../utils/sourceName.util';
+import { sourceDisplayName, sourcesForDocuments } from '../utils/sourceName.util';
 
-export default function SourcePanel({ sources = [], highlightedIndex = null }) {
-  if (!sources || sources.length === 0) return null;
+export default function SourcePanel({ sources = [], documents = [], highlightedIndex = null }) {
+  const workspaceSources = sourcesForDocuments(sources, documents);
+  if (workspaceSources.length === 0) return null;
 
   return (
     <div className="mt-4 pt-3" style={{ borderTop: '1px solid var(--dc-border)' }}>
@@ -11,7 +12,7 @@ export default function SourcePanel({ sources = [], highlightedIndex = null }) {
         Sources
       </p>
       <div className="space-y-2">
-        {sources.map((src) => (
+        {workspaceSources.map((src) => (
           <div
             key={src.index}
             className={`flex gap-3 rounded-lg border p-3 transition-all`}

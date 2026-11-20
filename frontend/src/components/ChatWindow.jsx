@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FileText, GitBranch, Search, SendHorizontal, Sparkles, Square, Terminal } from 'lucide-react';
+import { AtSign, FileText, GitBranch, Search, SendHorizontal, Sparkles, Square, Terminal, UploadCloud, X } from 'lucide-react';
 import api from '../utils/api.util';
 import ChatHistoryDrawer from './ChatHistoryDrawer';
 import IngestProgressBanner from './IngestProgressBanner';
@@ -28,6 +28,21 @@ function buildStreamUrl(path) {
 
 function genMessageId(prefix = 'msg') {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function documentDisplayName(doc = {}) {
+  const explicit = String(doc.displayName || doc.display_name || '').trim();
+  if (explicit) return explicit;
+  const internal = String(doc.name || doc.sourceName || doc.source_name || '').trim();
+  return internal.includes('__') ? internal.split('__').slice(1).join('__') : internal;
+}
+
+function documentSourceName(doc = {}) {
+  return String(doc.name || doc.sourceName || doc.source_name || '').trim();
+}
+
+function documentMentionTag(doc = {}) {
+  return `@[${documentDisplayName(doc).replaceAll(']', '')}]`;
 }
 
 function parseSseEventBlock(block) {
@@ -94,6 +109,7 @@ function normalizeHistoryPayload(payload) {
     .map((item) => {
       if (item && typeof item === 'object' && !Array.isArray(item)) {
         return {
+          id: item.id ? `history-${item.id}` : undefined,
           role: item.role,
           content: item.content,
           diagrams: Array.isArray(item.diagrams) ? item.diagrams : [],
@@ -104,7 +120,8 @@ function normalizeHistoryPayload(payload) {
         const diagramsFromTuple = Array.isArray(item[3])
           ? item[3]
           : (Array.isArray(item[2]) ? item[2] : []);
-        return { 
+        return {
+          id: undefined,
           role: item[0], 
           content: item[1],
           diagrams: diagramsFromTuple,
@@ -116,8 +133,26 @@ function normalizeHistoryPayload(payload) {
     .filter(Boolean);
 }
 
+function diagramHistoryFromMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+
+  return messages.flatMap((message, messageIndex) => {
+    if (message?.role !== 'ai' || !Array.isArray(message.diagrams)) return [];
+
+    return message.diagrams
+      .filter((diagram) => diagram?.flow?.nodes?.length)
+      .map((diagram, diagramIndex) => ({
+        id: `map-${messageIndex}-${diagramIndex}`,
+        title: diagram.title || diagram.name || `Context map ${messageIndex + 1}`,
+        summary: String(message.content || '').replace(/\s+/g, ' ').trim().slice(0, 100),
+        flow: diagram.flow,
+      }));
+  });
+}
+
 export default function ChatWindow({
   user,
+  docs = [],
   ingestState,
   onIngestStart,
   onIngestEvent,
@@ -136,16 +171,80 @@ export default function ChatWindow({
     const [sessionsVersion, setSessionsVersion] = useState(0);
     const messagesContainerRef = useRef(null);
     const messagesEndRef = useRef(null);
+    const inputRef = useRef(null);
     const streamAbortRef = useRef(null);
     const activeAssistantMessageIdRef = useRef(null);
     const shouldAutoScrollRef = useRef(true);
     const forceAutoScrollRef = useRef(false);
 
     const isDocumentProcessing = ingestState?.status === 'uploading' || ingestState?.status === 'processing';
+    const canUploadKnowledge = ['member', 'editor', 'admin', 'owner'].includes(user?.role);
 
     const username = user?.username ?? null;
 
     const effectiveSessionId = useMemo(() => activeSessionId, [activeSessionId]);
+    const mentionRange = useMemo(() => {
+      const cursor = inputRef.current?.selectionStart ?? input.length;
+      const beforeCursor = input.slice(0, cursor);
+      const match = beforeCursor.match(/(?:^|\s)@([^\]\n]*)$/);
+      if (!match) return null;
+      return {
+        start: beforeCursor.lastIndexOf('@'),
+        end: cursor,
+        query: match[1].trim().toLowerCase(),
+      };
+    }, [input]);
+    const mentionableDocs = useMemo(() => (docs || []).filter((doc) => documentSourceName(doc) && documentDisplayName(doc)), [docs]);
+    const documentSuggestions = useMemo(() => {
+      if (!mentionRange) return [];
+      return mentionableDocs
+        .filter((doc) => documentDisplayName(doc).toLowerCase().includes(mentionRange.query))
+        .slice(0, 6);
+    }, [mentionRange, mentionableDocs]);
+    const selectedMentionDocs = useMemo(() => {
+      const normalizedInput = input.toLowerCase();
+      return mentionableDocs.filter((doc) => normalizedInput.includes(documentMentionTag(doc).toLowerCase()));
+    }, [input, mentionableDocs]);
+
+    const insertDocumentMention = useCallback((doc) => {
+      const inputElement = inputRef.current;
+      const cursor = inputElement?.selectionStart ?? input.length;
+      const start = mentionRange?.start ?? cursor;
+      const end = mentionRange?.end ?? cursor;
+      const prefix = mentionRange ? '' : (input && !/\s$/.test(input.slice(0, cursor)) ? ' ' : '');
+      const inserted = `${prefix}${documentMentionTag(doc)} `;
+      const next = `${input.slice(0, start)}${inserted}${input.slice(end)}`;
+      const nextCursor = start + inserted.length;
+      setInput(next);
+      onInputChange?.(next);
+      window.setTimeout(() => {
+        inputElement?.focus();
+        inputElement?.setSelectionRange(nextCursor, nextCursor);
+      }, 0);
+    }, [input, mentionRange, onInputChange]);
+
+    const removeDocumentMention = useCallback((doc) => {
+      const tag = documentMentionTag(doc);
+      const next = input.replaceAll(tag, '').replace(/\s{2,}/g, ' ').trimStart();
+      setInput(next);
+      onInputChange?.(next);
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    }, [input, onInputChange]);
+
+    const startDocumentMention = useCallback(() => {
+      if (isTyping) return;
+      const inputElement = inputRef.current;
+      const cursor = inputElement?.selectionStart ?? input.length;
+      const prefix = cursor > 0 && !/\s$/.test(input.slice(0, cursor)) ? ' @' : '@';
+      const next = `${input.slice(0, cursor)}${prefix}${input.slice(cursor)}`;
+      const nextCursor = cursor + prefix.length;
+      setInput(next);
+      onInputChange?.(next);
+      window.setTimeout(() => {
+        inputElement?.focus();
+        inputElement?.setSelectionRange(nextCursor, nextCursor);
+      }, 0);
+    }, [input, isTyping, onInputChange]);
 
     const scrollToBottom = useCallback((behavior = 'smooth') => {
       messagesEndRef.current?.scrollIntoView({ behavior, block: 'end' });
@@ -177,19 +276,28 @@ export default function ChatWindow({
         try {
           const res = await api.post(`/get-history/${sessionId}`);
           const normalized = normalizeHistoryPayload(res?.data);
-          setMessages(
-            normalized.map((m) => ({
+          const nextMessages = normalized.map((m) => ({
+              id: m.id || genMessageId(m.role === 'human' ? 'human' : 'assistant'),
               role: m.role,
               content: m.content,
               diagrams: Array.isArray(m.diagrams) ? m.diagrams : [],
               sources: Array.isArray(m.sources) ? m.sources : [],
-            }))
-          );
+            }));
+          setMessages(nextMessages);
+          const latestAssistant = [...nextMessages].reverse().find((message) => message.role === 'ai');
+          onResponse?.({
+            answer: latestAssistant?.content || '',
+            diagrams: latestAssistant?.diagrams || [],
+            sources: latestAssistant?.sources || [],
+            diagramHistory: diagramHistoryFromMessages(nextMessages),
+            restored: true,
+          });
         } catch {
           setMessages([]);
+          onResponse?.({ answer: '', diagrams: [], sources: [], diagramHistory: [], restored: true });
         }
       },
-      [username]
+      [username, onResponse]
     );
 
     useEffect(() => {
@@ -254,33 +362,44 @@ export default function ChatWindow({
         setInput('');
         setIsTyping(false);
         setIsReceivingTokens(false);
+        onResponse?.({ answer: '', diagrams: [], sources: [], diagramHistory: [] });
         if (newSession?.sessionId) {
           setActiveSessionIdState(newSession.sessionId);
         }
       })();
-    }, [username]);
+    }, [username, onResponse]);
   
-    const sendMessage = async () => {
-      const text = input.trim();
+    const sendMessage = async (options = {}) => {
+      const text = String(options.textOverride ?? input).trim();
       if (!text || isTyping) return;
       if (!username || !effectiveSessionId) return;
+      const normalizedQuestion = text.toLowerCase();
+      const selectedSources = mentionableDocs
+        .filter((doc) => normalizedQuestion.includes(documentMentionTag(doc).toLowerCase()))
+        .map(documentSourceName);
+      const replaceMessageId = options.replaceMessageId || null;
+      const replaceHumanTurn = Number.isInteger(options.replaceHumanTurn)
+        ? options.replaceHumanTurn
+        : null;
 
       forceAutoScrollRef.current = true;
-      const userMsgId = genMessageId('human');
+      const userMsgId = replaceMessageId || genMessageId('human');
       const assistantMessageId = genMessageId('assistant');
       const userMsg = { id: userMsgId, role: 'human', content: text };
-      setMessages((prev) => [
-        ...prev,
-        userMsg,
-        {
+      const pendingAssistant = {
           id: assistantMessageId,
           role: 'ai',
           content: '',
           diagrams: [],
           sources: [],
           streaming: true,
-        },
-      ]);
+        };
+      setMessages((prev) => {
+        if (!replaceMessageId) return [...prev, userMsg, pendingAssistant];
+        const replaceIndex = prev.findIndex((message) => message.id === replaceMessageId);
+        if (replaceIndex < 0) return [...prev, userMsg, pendingAssistant];
+        return [...prev.slice(0, replaceIndex), userMsg, pendingAssistant];
+      });
       setInput("");
       setIsTyping(true);
       setThinkingStage('retrieving');
@@ -295,6 +414,8 @@ export default function ChatWindow({
         const res = await api.post('/get-answer', {
           question: text,
           sessionId: effectiveSessionId,
+          selectedSources,
+          replaceHumanTurn,
         });
 
         const answer = String(res?.data?.answer ?? '').trim();
@@ -332,6 +453,8 @@ export default function ChatWindow({
           body: JSON.stringify({
             question: text,
             sessionId: effectiveSessionId,
+            selectedSources,
+            replaceHumanTurn,
           }),
           signal: controller.signal,
         });
@@ -472,6 +595,34 @@ export default function ChatWindow({
       setIsReceivingTokens(false);
     };
 
+    const editHumanMessage = (messageId, content) => {
+      if (isTyping) return;
+      const messageIndex = messages.findIndex((message) => message.id === messageId);
+      if (messageIndex < 0) return;
+      const replaceHumanTurn = messages
+        .slice(0, messageIndex + 1)
+        .filter((message) => message.role === 'human').length - 1;
+      sendMessage({ textOverride: content, replaceMessageId: messageId, replaceHumanTurn });
+    };
+
+    const retryAssistantMessage = (messageId) => {
+      if (isTyping) return;
+      const assistantIndex = messages.findIndex((message) => message.id === messageId);
+      if (assistantIndex < 0) return;
+      let humanIndex = assistantIndex - 1;
+      while (humanIndex >= 0 && messages[humanIndex].role !== 'human') humanIndex -= 1;
+      if (humanIndex < 0) return;
+      const humanMessage = messages[humanIndex];
+      const replaceHumanTurn = messages
+        .slice(0, humanIndex + 1)
+        .filter((message) => message.role === 'human').length - 1;
+      sendMessage({
+        textOverride: humanMessage.content,
+        replaceMessageId: humanMessage.id,
+        replaceHumanTurn,
+      });
+    };
+
     const slashMatches = input.startsWith('/') && !input.includes(' ')
       ? SLASH_COMMANDS.filter((item) => item.command.startsWith(input.toLowerCase()))
       : [];
@@ -515,7 +666,14 @@ export default function ChatWindow({
             : messages.map((m) => (
               m.role === 'ai' && m.streaming && !m.content
                 ? null
-                : <MessageBubble key={m.id ?? `${m.role}_${m.content?.slice(0,20)}`} message={m} />
+                : <MessageBubble
+                    key={m.id ?? `${m.role}_${m.content?.slice(0,20)}`}
+                    message={m}
+                    documents={docs}
+                    disabled={isTyping}
+                    onEdit={m.role === 'human' ? editHumanMessage : undefined}
+                    onRetry={m.role === 'ai' && !m.streaming ? retryAssistantMessage : undefined}
+                  />
             ))
           }
           {isTyping && !isReceivingTokens && <ThinkingIndicator stage={thinkingStage} />}
@@ -523,15 +681,71 @@ export default function ChatWindow({
         </div>
   
         <div
-          className="relative flex items-end gap-3 rounded-2xl p-2"
+          className="relative flex items-end gap-2 rounded-2xl p-1.5"
           style={{
-            background: 'var(--dc-surface-1)',
+            background: 'var(--dc-surface-0)',
             border: `1px solid ${input.trim() || isTyping ? 'var(--dc-brand-border)' : 'var(--dc-border)'}`,
             boxShadow: input.trim() ? '0 0 0 3px rgba(37,99,235,0.08)' : 'none',
             transition: 'border-color 0.2s, box-shadow 0.2s',
           }}
         >
+          {documentSuggestions.length > 0 && (
+            <div className="absolute z-30 bottom-[calc(100%+8px)] left-0 w-full max-w-md overflow-hidden rounded-xl" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border-strong)', boxShadow: '0 16px 42px rgba(30,52,78,.16)' }}>
+              <div className="flex items-center gap-2 border-b px-3 py-2" style={{ borderColor: 'var(--dc-border)' }}>
+                <AtSign size={13} style={{ color: 'var(--dc-brand)' }} />
+                <div><p className="text-xs font-semibold">Choose files for this answer</p><p className="text-[10px]" style={{ color: 'var(--dc-text-muted)' }}>The AI will search only the files you tag</p></div>
+              </div>
+              <div className="max-h-56 overflow-y-auto p-1.5 custom-scrollbar">
+                {documentSuggestions.map((doc) => (
+                  <button key={documentSourceName(doc)} type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => insertDocumentMention(doc)} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left hover:bg-slate-50">
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg" style={{ background: 'var(--dc-brand-dim)', color: 'var(--dc-brand)' }}><FileText size={15} /></span>
+                    <span className="min-w-0 flex-1"><span className="block truncate text-xs font-semibold">{documentDisplayName(doc)}</span><span className="block text-[10px] capitalize" style={{ color: 'var(--dc-text-muted)' }}>{doc.accessRole || doc.access_role || 'permitted'} access</span></span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={startDocumentMention}
+            disabled={isTyping || mentionableDocs.length === 0}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition disabled:opacity-40"
+            style={{ background: 'var(--dc-surface-1)', color: 'var(--dc-brand)' }}
+            aria-label="Choose files for this question"
+            title="Choose specific files"
+          >
+            <AtSign size={16} />
+          </button>
+
+          {canUploadKnowledge && (
+            <button
+              type="button"
+              onClick={() => window.dispatchEvent(new Event('deepcontext-open-upload'))}
+              disabled={isDocumentProcessing}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition disabled:opacity-40"
+              style={{ background: 'var(--dc-surface-1)', color: 'var(--dc-text-secondary)' }}
+              aria-label="Upload files to the knowledge base"
+              title={isDocumentProcessing ? 'An upload is already processing' : 'Upload knowledge'}
+            >
+              <UploadCloud size={16} />
+            </button>
+          )}
+
+          <div className="min-w-0 flex-1">
+          {selectedMentionDocs.length > 0 && (
+            <div className="mb-1.5 flex flex-wrap items-center gap-1.5 px-1">
+              <span className="text-[10px] font-medium" style={{ color: 'var(--dc-text-muted)' }}>Searching only:</span>
+              {selectedMentionDocs.map((doc) => (
+                <span key={documentSourceName(doc)} className="inline-flex max-w-48 items-center gap-1 rounded-full px-2 py-1 text-[10px] font-semibold" style={{ background: 'var(--dc-brand-dim)', color: 'var(--dc-brand)' }}>
+                  <AtSign size={10} /><span className="truncate">{documentDisplayName(doc)}</span>
+                  <button type="button" onClick={() => removeDocumentMention(doc)} className="shrink-0" aria-label={`Remove ${documentDisplayName(doc)} from this question`}><X size={10} /></button>
+                </span>
+              ))}
+            </div>
+          )}
           <textarea
+            ref={inputRef}
             value={input}
             onChange={(e) => {
               setInput(e.target.value);
@@ -540,6 +754,11 @@ export default function ChatWindow({
               e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px';
             }}
             onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && documentSuggestions.length > 0) {
+                e.preventDefault();
+                insertDocumentMention(documentSuggestions[0]);
+                return;
+              }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 sendMessage();
@@ -550,12 +769,13 @@ export default function ChatWindow({
             }}
             placeholder={
               isTyping  ? 'Press Esc to stop…'
-                          : "Message #channel (Type '/' for commands, Shift+Enter for new line)"
+                          : 'Ask your knowledge base…'
             }
             rows={1}
-            className="flex-1 resize-none bg-transparent text-sm leading-relaxed focus:outline-none custom-scrollbar"
+            className="block w-full resize-none bg-transparent px-1 py-2 text-sm leading-5 focus:outline-none custom-scrollbar"
             style={{ color: 'var(--dc-text-primary)', minHeight: '36px', maxHeight: '140px' }}
           />
+          </div>
 
           <button
             type="button"

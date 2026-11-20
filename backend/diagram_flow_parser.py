@@ -198,27 +198,48 @@ def parse_mermaid_to_flow(code: str) -> dict:
     edges = []
     edge_counter = 0
 
-    def _ensure_node(label: str) -> str:
-        nid = _make_id(label)
+    node_labels = {}
+
+    def _ensure_node(reference: str) -> str:
+        """Keep Mermaid IDs stable while showing their human-readable labels."""
+        nid = _make_id(reference)
         if nid not in nodes:
             nodes[nid] = {
                 "id": nid,
                 "type": "default",
-                "data": {"label": label},
+                "data": {"label": node_labels.get(reference, reference)},
                 "position": {"x": 0, "y": 0},
             }
+        elif reference in node_labels:
+            nodes[nid]["data"]["label"] = node_labels[reference]
         return nid
 
     # Mermaid edge patterns: A --> B, A -->|label| B, A --- B, etc.
     edge_pattern = re.compile(
         r'(\w+)\s*(-->|---\>|-->|==>|-.->|-\.->|<--|===|-\.-\>|---)\s*(?:\|([^|]+)\|)?\s*(\w+)',
     )
-    # Node definition patterns: A[label], A(text), A{diamond}, A((circle)), A>asymmetric]
+    # Node definition patterns: A[label], A(text), A{diamond}, A((circle)),
+    # A[[subroutine]], and A>asymmetric]. Definitions may appear inline on
+    # both ends of an edge, for example: A[Upload] --> B[Validate].
     node_def_pattern = re.compile(
-        r'(\w+)\s*(?:\[([^\]]+)\]|\(([^)]+)\)|\{([^}]+)\}|\(\(([^)]+)\)\)|>([^<]+)<)',
+        r'([A-Za-z_]\w*)\s*(?:\[\[?([^\]]+)\]\]?|\(\(([^)]+)\)\)|\(([^)]+)\)|\{([^}]+)\}|>([^\]]+)\])',
     )
     # Subgraph detection
     subgraph_pattern = re.compile(r'subgraph\s+(.+)', re.IGNORECASE)
+
+    # First collect labels for every node ID. This prevents labelled inline
+    # definitions from being mistaken for unrelated nodes named "A" or "B".
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("%%"):
+            continue
+        for node_match in node_def_pattern.finditer(line):
+            node_id = node_match.group(1)
+            label = next(
+                (value for value in node_match.groups()[1:] if value),
+                node_id,
+            )
+            node_labels[node_id] = label.strip().strip('"')
 
     for line in lines:
         line = line.strip()
@@ -227,8 +248,12 @@ def parse_mermaid_to_flow(code: str) -> dict:
         if line.startswith("end") or subgraph_pattern.match(line):
             continue
 
+        # Remove inline display shapes before parsing the relationship while
+        # retaining the Mermaid identifiers used by the edge.
+        normalized_line = node_def_pattern.sub(lambda match: match.group(1), line)
+
         # Try edge first (A --> B or A -->|label| B)
-        edge_match = edge_pattern.search(line)
+        edge_match = edge_pattern.search(normalized_line)
         if edge_match:
             src_label = edge_match.group(1)
             edge_label = edge_match.group(3) or ""
@@ -243,24 +268,15 @@ def parse_mermaid_to_flow(code: str) -> dict:
                 "target": tgt_id,
                 "label": edge_label,
                 "type": "smoothstep",
-                "animated": "-->" in line,
+                "animated": "-->" in normalized_line,
             })
             continue
 
         # Try node definition (A[label])
-        node_match = node_def_pattern.search(line)
-        if node_match:
-            node_id = node_match.group(1)
-            # Use the bracket content as label if available, else use the ID
-            label = (
-                node_match.group(2)
-                or node_match.group(3)
-                or node_match.group(4)
-                or node_match.group(5)
-                or node_match.group(6)
-                or node_id
-            )
-            _ensure_node(label)
+        node_matches = list(node_def_pattern.finditer(line))
+        if node_matches:
+            for node_match in node_matches:
+                _ensure_node(node_match.group(1))
             continue
 
         # Bare node reference (just an identifier on its own line)
