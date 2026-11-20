@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, AtSign, LoaderCircle, Send, Users, X } from 'lucide-react';
+import { AlertCircle, AtSign, BookPlus, Download, FileText, LoaderCircle, Paperclip, Send, Users, X } from 'lucide-react';
 import api from '../utils/api.util';
 import { connectNexconn, NEXCONN_TYPING_MESSAGE, nexconnResultError } from '../utils/nexconnClient.util';
+import { MAX_KNOWLEDGE_FILE_BYTES, knowledgeFileError } from '../utils/uploadFormats.util';
+import { waitForIngestProgress } from '../utils/ingestProgress.util';
 import ChatWindow from './ChatWindow';
 
 function DeepContextChat({
@@ -48,19 +50,42 @@ function sameChannel(message, channel) {
 function normalizeMessage(message, currentUser) {
   const sender = message.content?.senderUserInfo;
   const mine = message.senderUserId === currentUser?.providerId;
+  let extra = {};
+  try {
+    extra = JSON.parse(message.content?.extra || '{}');
+  } catch {
+    extra = {};
+  }
+  const isFile = message.messageType === 'RC:FileMsg'
+    || Boolean(message.content?.remoteUrl && message.content?.name && message.content?.size != null);
   return {
     id: message.messageId || `local-${message.clientId}-${message.sentTime}`,
-    text: message.content?.text || message.content?.content || `[${message.messageType || 'message'}]`,
+    text: isFile ? '' : (message.content?.text || message.content?.content || `[${message.messageType || 'message'}]`),
     senderId: message.senderUserId,
     senderName: mine ? currentUser.name : (sender?.name || message.content?.senderName || message.senderUserId || 'Unknown user'),
     sentTime: message.sentTime || Date.now(),
     mentionedUserIds: message.content?.mentionedInfo?.userIdList || [],
+    attachment: isFile ? {
+      name: message.content?.name || 'Shared file',
+      size: Number(message.content?.size || 0),
+      fileType: message.content?.fileType || '',
+      remoteUrl: message.content?.remoteUrl || '',
+      documentId: extra.deepcontext_document_id || '',
+      knowledgeCompatible: Boolean(extra.deepcontext_document_id),
+    } : null,
   };
 }
 
 function subscriptionIsOnline(status) {
   if (typeof status?.isOnline === 'boolean') return status.isOnline;
   return (status?.details || []).some((detail) => detail.isOnline === true || detail.eventValue === 1);
+}
+
+function formatFileSize(bytes) {
+  if (!bytes) return 'Unknown size';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function renderMessageText(value, members) {
@@ -73,7 +98,7 @@ function renderMessageText(value, members) {
     : part);
 }
 
-function NexconnChannel({ user }) {
+function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, onIngestFailed }) {
   const [status, setStatus] = useState('loading');
   const [reason, setReason] = useState('Connecting to Nexconn…');
   const [session, setSession] = useState(null);
@@ -84,6 +109,8 @@ function NexconnChannel({ user }) {
   const [members, setMembers] = useState([]);
   const [showMembers, setShowMembers] = useState(false);
   const [mentionRange, setMentionRange] = useState(null);
+  const [attachmentUpload, setAttachmentUpload] = useState(null);
+  const [attachmentActions, setAttachmentActions] = useState({});
   const channelRef = useRef(null);
   const sdkRef = useRef(null);
   const scrollRef = useRef(null);
@@ -91,6 +118,7 @@ function NexconnChannel({ user }) {
   const lastTypingSentRef = useRef(0);
   const sessionRef = useRef(null);
   const inputRef = useRef(null);
+  const attachmentInputRef = useRef(null);
 
   const applyPresence = useCallback((statuses) => {
     const onlineById = new Map((statuses || []).map((item) => [item.userId, subscriptionIsOnline(item)]));
@@ -328,8 +356,99 @@ function NexconnChannel({ user }) {
     }
   };
 
+  const discardStagedShare = async (documentId) => {
+    if (!documentId) return;
+    try {
+      await api.delete(`/nexconn/share-file/${documentId}`);
+    } catch {
+      // The pending document remains visible to editors if cleanup is not
+      // possible, so it can still be explicitly reviewed or rejected.
+    }
+  };
+
+  const sendAttachment = async (file) => {
+    if (!file || !channelRef.current || !sdkRef.current || (attachmentUpload && !attachmentUpload.error)) return;
+    if (file.size > MAX_KNOWLEDGE_FILE_BYTES) {
+      setAttachmentUpload({ name: file.name, progress: 0, error: 'Chat attachments are limited to 15MB.' });
+      if (attachmentInputRef.current) attachmentInputRef.current.value = '';
+      return;
+    }
+
+    setAttachmentUpload({ name: file.name, progress: 0, error: '' });
+    let documentId = '';
+    try {
+      // Supported knowledge files are staged as a pending proposal. Other
+      // formats remain ordinary Nexconn attachments and cannot be indexed.
+      if (!knowledgeFileError(file)) {
+        try {
+          const formData = new FormData();
+          formData.append('file', file);
+          const staged = await api.post('/nexconn/share-file', formData);
+          documentId = staged.data?.document_id || '';
+        } catch {
+          documentId = '';
+        }
+      }
+
+      const prepared = await sdkRef.current.Helper.createSendFileMessageParams(file);
+      if (!prepared.isOk || !prepared.data) {
+        throw new Error(resultError(prepared, 'Nexconn could not prepare this attachment'));
+      }
+      if (documentId) {
+        prepared.data.content.extra = JSON.stringify({ deepcontext_document_id: documentId });
+      }
+      prepared.data.onUploadProgress = (progress) => {
+        setAttachmentUpload({ name: file.name, progress: Math.max(0, Math.min(100, Math.round(progress))), error: '' });
+      };
+      const sent = await channelRef.current.sendMediaMessage(prepared.data);
+      if (!sent.isOk) throw new Error(resultError(sent, 'Nexconn could not send this attachment'));
+      if (sent.data) addMessages([sent.data]);
+      setAttachmentUpload(null);
+      if (documentId) window.dispatchEvent(new Event('documents-pending'));
+    } catch (error) {
+      await discardStagedShare(documentId);
+      setAttachmentUpload({ name: file.name, progress: 0, error: error.message || 'Attachment could not be sent.' });
+    } finally {
+      if (attachmentInputRef.current) attachmentInputRef.current.value = '';
+    }
+  };
+
+  const addAttachmentToWorkspace = async (attachment) => {
+    if (!attachment?.documentId || attachmentActions[attachment.documentId]) return;
+    const documentId = attachment.documentId;
+    setAttachmentActions((previous) => ({ ...previous, [documentId]: { status: 'starting', message: 'Starting ingestion…' } }));
+    onIngestStart?.(attachment.name);
+    try {
+      const response = await api.post(`/approve-document/${documentId}`);
+      const jobId = response.data?.job_id;
+      setAttachmentActions((previous) => ({ ...previous, [documentId]: { status: 'processing', message: 'Adding to workspace…' } }));
+      if (jobId) {
+        const progress = await waitForIngestProgress(jobId, {
+          onEvent: (event) => {
+            setAttachmentActions((previous) => ({ ...previous, [documentId]: { status: event.stage, message: event.message || 'Adding to workspace…' } }));
+            onIngestEvent?.(event);
+          },
+        });
+        if (progress.ok) {
+          setAttachmentActions((previous) => ({ ...previous, [documentId]: { status: 'completed', message: 'Added to workspace' } }));
+          await onIngestComplete?.();
+          window.dispatchEvent(new Event('document-indexed'));
+        } else if (progress.fallback) {
+          setAttachmentActions((previous) => ({ ...previous, [documentId]: { status: 'processing', message: 'Ingestion continues in background' } }));
+        } else {
+          throw new Error(progress.event?.message || 'Ingestion failed');
+        }
+      }
+    } catch (error) {
+      const message = error?.response?.data?.detail || error.message || 'Could not add file to workspace.';
+      setAttachmentActions((previous) => ({ ...previous, [documentId]: { status: 'failed', message } }));
+      onIngestFailed?.({ message });
+    }
+  };
+
   const channelLabel = useMemo(() => session?.channel?.name || 'Nexconn Channel', [session]);
   const onlineCount = members.filter((member) => member.online).length;
+  const canAddAttachments = ['editor', 'admin', 'owner'].includes(user?.role);
   const mentionSuggestions = useMemo(() => {
     if (!mentionRange) return [];
     return members.filter((member) => member.provider_id !== session?.user_id
@@ -374,7 +493,17 @@ function NexconnChannel({ user }) {
         return <div key={message.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
           <div className="max-w-[75%] rounded-2xl px-4 py-2.5" style={{ background: mine ? 'var(--dc-brand-dim)' : 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}>
             <p className="text-[10px] font-semibold mb-1" style={{ color: mine ? 'var(--dc-text-secondary)' : 'var(--dc-brand)' }}>{mine ? `${message.senderName} · You` : message.senderName}</p>
-            <p className="text-sm whitespace-pre-wrap break-words">{renderMessageText(message.text, members)}</p>
+            {message.attachment ? <div className="min-w-[230px] max-w-sm rounded-xl p-3" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border-strong)' }}>
+              <div className="flex items-center gap-2.5">
+                <span className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{ background: 'var(--dc-brand-dim)', color: 'var(--dc-brand)' }}><FileText size={17} /></span>
+                <div className="min-w-0 flex-1"><p className="text-xs font-semibold truncate">{message.attachment.name}</p><p className="text-[9px] mt-0.5" style={{ color: 'var(--dc-text-muted)' }}>{formatFileSize(message.attachment.size)}{message.attachment.fileType ? ` · ${message.attachment.fileType}` : ''}</p></div>
+                {message.attachment.remoteUrl && <a href={message.attachment.remoteUrl} target="_blank" rel="noreferrer" download={message.attachment.name} className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ color: 'var(--dc-brand)', border: '1px solid var(--dc-border)' }} aria-label={`Download ${message.attachment.name}`}><Download size={15} /></a>}
+              </div>
+              {message.attachment.documentId ? <div className="mt-2 pt-2 border-t" style={{ borderColor: 'var(--dc-border)' }}>
+                {canAddAttachments ? <button type="button" onClick={() => addAttachmentToWorkspace(message.attachment)} disabled={Boolean(attachmentActions[message.attachment.documentId]) && attachmentActions[message.attachment.documentId].status !== 'failed'} className="w-full rounded-lg px-2.5 py-1.5 flex items-center justify-center gap-1.5 text-[10px] font-semibold disabled:opacity-60" style={{ color: 'var(--dc-green)', background: 'rgba(16,185,129,.10)', border: '1px solid rgba(16,185,129,.22)' }}><BookPlus size={13} />{attachmentActions[message.attachment.documentId]?.message || 'Add to workspace'}</button>
+                  : <p className="text-[9px] flex items-center gap-1" style={{ color: 'var(--dc-text-muted)' }}><BookPlus size={11} />Waiting for an editor to add this to the workspace</p>}
+              </div> : <p className="text-[9px] mt-2" style={{ color: 'var(--dc-text-muted)' }}>Chat attachment only · this format cannot be indexed</p>}
+            </div> : <p className="text-sm whitespace-pre-wrap break-words">{renderMessageText(message.text, members)}</p>}
             {message.mentionedUserIds.includes(session?.user_id) && <span className="inline-flex items-center gap-1 mt-1 text-[9px] font-semibold" style={{ color: 'var(--dc-brand)' }}><AtSign size={10} />Mentioned you</span>}
             <p className="text-[9px] text-right mt-1" style={{ color: 'var(--dc-text-muted)' }}>{new Date(message.sentTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
           </div>
@@ -388,17 +517,23 @@ function NexconnChannel({ user }) {
         {[0, 1, 2].map((dot) => <span key={dot} className="w-1 h-1 rounded-full animate-bounce" style={{ background: 'currentColor', animationDelay: `${dot * 140}ms`, animationDuration: '850ms' }} />)}
       </span>
     </div>}
+    {attachmentUpload && <div className="mx-4 mb-2 rounded-lg px-3 py-2" style={{ background: attachmentUpload.error ? 'rgba(244,63,94,.08)' : 'var(--dc-brand-dim)', border: `1px solid ${attachmentUpload.error ? 'rgba(244,63,94,.22)' : 'var(--dc-brand-border)'}` }}>
+      <div className="flex items-center justify-between gap-3 text-[10px]"><span className="truncate" style={{ color: attachmentUpload.error ? 'var(--dc-red)' : 'var(--dc-text-secondary)' }}>{attachmentUpload.error || `Sharing ${attachmentUpload.name}`}</span>{!attachmentUpload.error && <span className="tabular-nums" style={{ color: 'var(--dc-brand)' }}>{attachmentUpload.progress}%</span>}</div>
+      {!attachmentUpload.error && <div className="h-1 rounded-full mt-1.5 overflow-hidden" style={{ background: 'var(--dc-surface-2)' }}><div className="h-full transition-all" style={{ width: `${attachmentUpload.progress}%`, background: 'var(--dc-brand)' }} /></div>}
+    </div>}
     <form onSubmit={sendMessage} className="p-4 border-t flex gap-2 relative" style={{ borderColor: 'var(--dc-border)' }}>
       {mentionSuggestions.length > 0 && <div className="absolute z-20 left-4 bottom-[70px] w-72 rounded-xl shadow-xl p-1.5" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border-strong)' }}>
         <p className="px-2 py-1 text-[10px] uppercase tracking-wider" style={{ color: 'var(--dc-text-muted)' }}>Mention someone</p>
         {mentionSuggestions.map((member) => <button key={member.provider_id} type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => insertMention(member)} className="w-full flex items-center gap-2 rounded-lg px-2 py-2 text-left"><span className="w-2 h-2 rounded-full" style={{ background: member.online ? 'var(--dc-green)' : 'var(--dc-text-muted)' }} /><span className="text-xs font-medium flex-1 truncate">{member.name}</span><span className="text-[10px] capitalize" style={{ color: 'var(--dc-text-muted)' }}>{member.online ? 'online' : member.role}</span></button>)}
       </div>}
-      <input ref={inputRef} value={text} onChange={handleTextChange} onBlur={() => sendTypingState(false)} disabled={status !== 'connected'} maxLength={4096} placeholder="Message the channel or type @ to mention…" className="flex-1 rounded-xl px-4 py-3 text-sm outline-none" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border-strong)', color: 'var(--dc-text-primary)' }} />
+      <input ref={attachmentInputRef} type="file" className="hidden" onChange={(event) => sendAttachment(event.target.files?.[0])} />
+      <button type="button" onClick={() => attachmentInputRef.current?.click()} disabled={status !== 'connected' || Boolean(attachmentUpload && !attachmentUpload.error)} className="rounded-xl px-3 disabled:opacity-40" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border-strong)', color: 'var(--dc-text-secondary)' }} aria-label="Share a file"><Paperclip size={17} /></button>
+      <input ref={inputRef} value={text} onChange={handleTextChange} onBlur={() => sendTypingState(false)} disabled={status !== 'connected'} maxLength={4096} placeholder="Message, @mention, or share a file…" className="flex-1 rounded-xl px-4 py-3 text-sm outline-none" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border-strong)', color: 'var(--dc-text-primary)' }} />
       <button type="submit" disabled={status !== 'connected' || sending || !text.trim()} className="rounded-xl px-4 disabled:opacity-40" style={{ background: 'var(--dc-brand)', color: 'white' }} aria-label="Send Nexconn message"><Send size={18} /></button>
     </form>
   </div>;
 }
 
 export default function NexconnChat({ mode = 'ai', ...props }) {
-  return mode === 'nexconn' ? <NexconnChannel user={props.user} /> : <DeepContextChat {...props} />;
+  return mode === 'nexconn' ? <NexconnChannel {...props} /> : <DeepContextChat {...props} />;
 }

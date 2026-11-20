@@ -297,7 +297,11 @@ class DataIngestor:
                     final_docs = raw_docs
             elif ext in OFFICE_EXTENSIONS:
                 final_docs = load_office_documents(filePath)
-            elif ext in ['.txt', '.md', '.puml', '.mmd', '.mermaid']:
+            elif ext in [
+                '.txt', '.md', '.puml', '.mmd', '.mermaid',
+                '.csv', '.json', '.jsonl', '.yaml', '.yml',
+                '.xml', '.html', '.htm', '.log', '.rst',
+            ]:
                 try:
                     loader = TextLoader(filePath,encoding="utf-8")
                     final_docs = loader.load()

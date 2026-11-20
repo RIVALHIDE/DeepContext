@@ -26,13 +26,13 @@ export default function MessageBubble({ message }) {
   }
 
   return (
-    <div className="flex items-start gap-3 mb-5">
+    <div className="flex min-w-0 items-start gap-3 mb-5">
       <div className="shrink-0 mt-0.5">
         <SonarGlyph state={isStreaming ? 'generating' : 'idle'} size={28} />
       </div>
 
       <div
-        className="flex-1 max-w-[84%] rounded-2xl rounded-tl-sm px-4 py-3 overflow-hidden"
+        className="min-w-0 w-fit max-w-[92%] rounded-2xl rounded-tl-sm px-4 py-3 overflow-hidden"
         style={{
           background: isBlocked ? 'rgba(245, 158, 11, 0.07)' : 'var(--dc-surface-1)',
           border: `1px solid ${isBlocked ? 'rgba(245, 158, 11, 0.32)' : isStreaming ? 'var(--dc-brand-border)' : 'var(--dc-border)'}`,

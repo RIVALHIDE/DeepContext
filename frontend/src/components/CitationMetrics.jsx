@@ -1,4 +1,5 @@
 import { FileSearch, Hash, Cpu, TrendingUp } from 'lucide-react';
+import { sourceDisplayName } from '../utils/sourceName.util';
 
 /**
  * CitationMetrics — displays LLM token usage and source citation stats.
@@ -121,7 +122,7 @@ export default function CitationMetrics({ sources = [], tokenUsage = null }) {
                   className="text-[11px] font-medium truncate"
                   style={{ color: 'var(--dc-text-primary)' }}
                 >
-                  {source.sourceName || source.source_name || `Source ${idx + 1}`}
+                  {sourceDisplayName(source) || `Source ${idx + 1}`}
                 </p>
                 {source.preview && (
                   <p

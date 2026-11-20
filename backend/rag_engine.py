@@ -376,6 +376,21 @@ class DeepContextEngine:
             preview_source = fallback_text if fallback_text is not None else doc.page_content
         return str(preview_source or "")[:limit].replace("\n", " ")
 
+    @staticmethod
+    def _display_source_name(source_name: str, metadata: dict | None = None) -> str:
+        """Hide the workspace storage prefix while preserving the auth key."""
+        value = os.path.basename(str(source_name or "unknown"))
+        team_id = str((metadata or {}).get("team_id") or "")
+        prefix = f"{team_id}__" if team_id else ""
+        if prefix and value.casefold().startswith(prefix.casefold()):
+            return value[len(prefix):]
+        # Compatibility for chunks created before team_id was consistently
+        # present. Workspace IDs are opaque hex/UUID-like values.
+        head, separator, tail = value.partition("__")
+        if separator and len(head) >= 16 and all(char in "0123456789abcdef-" for char in head.casefold()):
+            return tail
+        return value
+
     
     @staticmethod
     def _build_sources_list(docs: List[Document], primary_source_names: set | None = None) -> list:
@@ -426,6 +441,7 @@ class DeepContextEngine:
             sources.append({
                 "index": idx,
                 "sourceName": source_name,
+                "displayName": DeepContextEngine._display_source_name(source_name, first_meta),
                 "page": first_meta.get("page"),
                 "chunkIndex": first_meta.get("chunk_index"),
                 "preview": preview,

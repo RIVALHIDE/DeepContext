@@ -52,12 +52,21 @@ ALLOWED_MIME_TYPES = {
     "image/jpg",
     "text/plain",
     "text/markdown",
+    "text/csv",
+    "text/html",
+    "text/xml",
+    "application/json",
+    "application/xml",
+    "application/x-yaml",
+    "text/yaml",
     "application/octet-stream",  # .puml, .mmd, .mermaid may report this
 }
 
 ALLOWED_EXTENSIONS = {
     ".pdf", ".png", ".jpg", ".jpeg",
     ".txt", ".md", ".puml", ".mmd", ".mermaid",
+    ".csv", ".json", ".jsonl", ".yaml", ".yml",
+    ".xml", ".html", ".htm", ".log", ".rst",
 }
 ALLOWED_EXTENSIONS.update(OFFICE_EXTENSIONS)
 
@@ -182,7 +191,10 @@ async def upload_docs(file: UploadFile = File(...), access_role: str = Form(""))
     mime_type = file.content_type or ""
     ext = os.path.splitext(file.filename or "")[1].lower()
 
-    if mime_type not in ALLOWED_MIME_TYPES and ext not in ALLOWED_EXTENSIONS:
+    # Extension allowlisting is authoritative. Browsers often report valid
+    # Office/diagram files as application/octet-stream, so MIME is advisory;
+    # an unknown binary extension must never bypass validation via that MIME.
+    if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=415,
             detail=f"Unsupported file type: mime={mime_type}, ext={ext}. "
@@ -242,6 +254,80 @@ async def upload_docs(file: UploadFile = File(...), access_role: str = Form(""))
         "file_size": file_size,
         "access_role": access_role,
     }
+
+
+@app.post("/nexconn/share-file", status_code=201)
+async def stage_nexconn_shared_file(file: UploadFile = File(...)):
+    """Stage a chat attachment for optional editor-approved ingestion.
+
+    Every workspace role may share a file in Nexconn, but this endpoint only
+    creates a pending proposal. It never writes to Chroma or grants the sender
+    upload privileges; an editor, admin, or owner must approve it separately.
+    """
+    actor = current()
+    content = await file.read(MAX_FILE_SIZE + 1)
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, "Shared knowledge files are limited to 15 MB each")
+
+    safe_name = os.path.basename((file.filename or '').replace('\\', '/'))
+    extension = os.path.splitext(safe_name)[1].lower()
+    if not safe_name or safe_name in ('.', '..'):
+        raise HTTPException(422, 'A valid filename is required')
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(415, 'This attachment can be shared in chat but its format cannot be added to the knowledge base')
+
+    document_id = str(uuid.uuid4())
+    source_name = f"{actor['workspace_id']}__{safe_name}"
+    upload_dir = os.path.join('./data', 'uploads', actor['workspace_id'], document_id)
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, source_name)
+    with open(file_path, 'wb') as buffer:
+        buffer.write(content)
+
+    create_pending_upload(
+        document_id=document_id,
+        source_name=source_name,
+        file_path=file_path,
+        file_size=len(content),
+        mime_type=file.content_type or extension,
+        uploaded_by=actor['id'],
+        team_id=actor['workspace_id'],
+    )
+    with auth_connect() as database:
+        database.execute(
+            'UPDATE pending_uploads SET access_level=? WHERE document_id=?',
+            (ROLES['viewer'], document_id),
+        )
+    return {
+        'document_id': document_id,
+        'file_name': safe_name,
+        'status': 'pending_approval',
+        'message': 'File shared. An editor can add it to the workspace.',
+    }
+
+
+@app.delete("/nexconn/share-file/{document_id}")
+def discard_failed_nexconn_share(document_id: str):
+    """Remove staging when Nexconn rejects the corresponding attachment."""
+    actor = current()
+    with auth_connect() as database:
+        record = database.execute(
+            """SELECT file_path FROM pending_uploads
+               WHERE document_id=? AND team_id=? AND uploaded_by=? AND status='pending_approval'""",
+            (document_id, actor['workspace_id'], actor['id']),
+        ).fetchone()
+        if not record:
+            raise HTTPException(404, 'Shared file proposal not found')
+        database.execute(
+            "UPDATE pending_uploads SET status='rejected' WHERE document_id=?",
+            (document_id,),
+        )
+    try:
+        os.remove(record['file_path'])
+        os.rmdir(os.path.dirname(record['file_path']))
+    except OSError:
+        pass
+    return {'message': 'Unsent shared file removed'}
 
 
 @app.get("/pending-documents")

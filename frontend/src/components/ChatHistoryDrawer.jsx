@@ -8,6 +8,11 @@ import {
 import { ensureInitialChatSession, getChatSessions } from '../utils/chatSessions.util';
 import ConfirmModal from './ui/ConfirmModal';
 import NexconnHuddle from './NexconnHuddle';
+import { knowledgeFileError } from '../utils/uploadFormats.util';
+
+function uploadValidationError(file) {
+  return knowledgeFileError(file);
+}
 
 function formatTime(iso) {
   if (!iso) return '';
@@ -37,7 +42,9 @@ export default function ChatHistoryDrawer({
   const [sessions, setSessions] = useState([]);
   const [accessRole, setAccessRole] = useState(user?.role || 'viewer');
   const [uploadOpen, setUploadOpen] = useState(false);
-  const [selectedFile, setSelectedFile] = useState(null);
+  const [selectedFiles, setSelectedFiles] = useState([]);
+  const [batchRows, setBatchRows] = useState([]);
+  const [batchUploading, setBatchUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const [huddleOpen, setHuddleOpen] = useState(false);
   const canUpload = ['member', 'editor', 'admin', 'owner'].includes(user?.role);
@@ -73,7 +80,7 @@ export default function ChatHistoryDrawer({
     })();
   }, [username, sessionsVersion, isOpen]);
 
-  const pollJobStatus = async (jobId, fileName) => {
+  const pollJobStatus = async (jobId, fileName, batchLabel = fileName) => {
     const maxAttempts = 300;
     const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -86,7 +93,7 @@ export default function ChatHistoryDrawer({
           onIngestEvent?.({
             stage,
             message,
-            meta: { file_name: fileName },
+            meta: { file_name: batchLabel },
           });
         }
 
@@ -94,7 +101,7 @@ export default function ChatHistoryDrawer({
           onIngestEvent?.({
             stage: 'completed',
             message: STAGE_LABELS.completed,
-            meta: { file_name: fileName },
+            meta: { file_name: batchLabel },
           });
           return { ok: true };
         }
@@ -102,7 +109,7 @@ export default function ChatHistoryDrawer({
           onIngestEvent?.({
             stage: 'failed',
             message: message || STAGE_LABELS.failed,
-            meta: { file_name: fileName },
+            meta: { file_name: batchLabel },
           });
           return { ok: false };
         }
@@ -117,79 +124,111 @@ export default function ChatHistoryDrawer({
     return { ok: false };
   };
 
-  const handleUpload = async (file) => {
-    if (!file || isUploading) return;
+  const updateBatchRow = (index, patch) => {
+    setBatchRows((previous) => previous.map((row, rowIndex) => rowIndex === index ? { ...row, ...patch } : row));
+  };
 
-    const extension = `.${file.name.split('.').pop()?.toLowerCase() || ''}`;
-    const allowed = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.txt', '.md', '.puml', '.mmd', '.mermaid', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx']);
-    if (file.size > 15 * 1024 * 1024) {
-      setUploadError('This file is larger than the 15MB limit.');
-      return;
-    }
-    if (!allowed.has(extension)) {
-      setUploadError('This file type is not supported. Choose a document, image, diagram, or Office file.');
-      return;
-    }
-    setUploadError('');
-
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('access_role', accessRole);
-
-    onIngestStart?.(file.name);
-
-    try {
-      const res = await api.post('/upload', formData);
-      // The dialog covers only the browser-to-API transfer. Once accepted,
-      // indexing continues in the background status strip.
-      setUploadOpen(false);
-      setSelectedFile(null);
-
-      if (res.data?.status === 'pending_approval') {
-        onIngestEvent?.({ stage: 'pending_approval', message: 'Uploaded. Waiting for an editor or admin to approve it in Pull Requests.', meta: { file_name: file.name } });
-        window.dispatchEvent(new Event('documents-pending'));
-        return;
-      }
-
-      const jobId = res.data?.job_id;
-      if (jobId) {
-        const progressResult = await waitForIngestProgress(jobId, {
-          onEvent: (event) => onIngestEvent?.(event),
-        });
-
-        if (progressResult.fallback) {
-          const pollResult = await pollJobStatus(jobId, file.name);
-          if (pollResult.ok) {
-            await onIngestComplete?.();
-          } else {
-            onIngestFailed?.({ message: STAGE_LABELS.failed });
-          }
-        } else if (progressResult.ok) {
-          await onIngestComplete?.();
-        } else {
-          onIngestFailed?.(
-            progressResult.event ?? { message: STAGE_LABELS.failed }
-          );
-        }
+  const monitorBatchJobs = async (jobs, batchLabel) => {
+    let completed = 0;
+    let failed = 0;
+    for (const job of jobs) {
+      updateBatchRow(job.index, { status: 'processing', detail: 'Indexing…' });
+      const progressResult = await waitForIngestProgress(job.jobId, {
+        onEvent: (event) => {
+          updateBatchRow(job.index, { status: 'processing', detail: event?.message || 'Indexing…' });
+          onIngestEvent?.({
+            ...event,
+            message: `${job.file.name}: ${event?.message || 'Indexing…'}`,
+            meta: { ...(event?.meta || {}), file_name: batchLabel },
+          });
+        },
+      });
+      const result = progressResult.fallback
+        ? await pollJobStatus(job.jobId, job.file.name, batchLabel)
+        : { ok: progressResult.ok };
+      if (result.ok) {
+        completed += 1;
+        updateBatchRow(job.index, { status: 'completed', detail: 'Ready in knowledge base' });
       } else {
-        onIngestEvent?.({
-          stage: 'completed',
-          message: 'Upload successful.',
-          meta: { file_name: file.name },
-        });
-        await onIngestComplete?.();
+        failed += 1;
+        updateBatchRow(job.index, { status: 'failed', detail: progressResult.event?.message || STAGE_LABELS.failed });
       }
-    } catch (err) {
-      console.error('Upload failed', err);
-      const detail = err?.response?.data?.detail;
-      const message = typeof detail === 'string'
-        ? detail
-        : err?.response
-          ? `Upload failed (HTTP ${err.response.status}). Check the API terminal for details.`
-          : `Cannot reach the API at ${api.defaults.baseURL}. Check that the API is running and reachable.`;
-      onIngestFailed?.({ message });
-      setUploadError(message);
+      onIngestEvent?.({
+        stage: failed ? 'processing' : 'indexing',
+        message: `${completed + failed} of ${jobs.length} files processed`,
+        meta: { file_name: batchLabel },
+      });
     }
+    if (completed) await onIngestComplete?.();
+    if (failed) onIngestFailed?.({ message: `${failed} file${failed === 1 ? '' : 's'} failed. Other files continued processing.` });
+  };
+
+  const handleUpload = async (files) => {
+    const chosen = Array.from(files || []);
+    if (!chosen.length || batchUploading) return;
+
+    const rows = chosen.map((file) => {
+      const error = uploadValidationError(file);
+      return { file, status: error ? 'failed' : 'waiting', detail: error };
+    });
+    setBatchRows(rows);
+    const valid = rows.map((row, index) => ({ ...row, index })).filter((row) => !row.detail);
+    if (!valid.length) {
+      setUploadError('None of the selected files can be uploaded. Check the per-file errors below.');
+      return;
+    }
+
+    setUploadError('');
+    setBatchUploading(true);
+    const batchLabel = valid.length === 1 ? valid[0].file.name : `${valid.length} files`;
+    onIngestStart?.(batchLabel);
+    const jobs = [];
+    let pendingCount = 0;
+    let accepted = 0;
+    let failed = rows.length - valid.length;
+
+    for (const item of valid) {
+      updateBatchRow(item.index, { status: 'uploading', detail: 'Uploading to server…' });
+      const formData = new FormData();
+      formData.append('file', item.file);
+      formData.append('access_role', accessRole);
+      try {
+        const response = await api.post('/upload', formData);
+        accepted += 1;
+        if (response.data?.status === 'pending_approval') {
+          pendingCount += 1;
+          updateBatchRow(item.index, { status: 'pending', detail: 'Waiting for approval' });
+        } else if (response.data?.job_id) {
+          jobs.push({ index: item.index, file: item.file, jobId: response.data.job_id });
+          updateBatchRow(item.index, { status: 'queued', detail: 'Queued for indexing' });
+        } else {
+          updateBatchRow(item.index, { status: 'completed', detail: 'Upload complete' });
+        }
+      } catch (error) {
+        failed += 1;
+        const detail = error?.response?.data?.detail;
+        updateBatchRow(item.index, {
+          status: 'failed',
+          detail: typeof detail === 'string' ? detail : `Upload failed${error?.response?.status ? ` (HTTP ${error.response.status})` : ''}`,
+        });
+      }
+    }
+
+    setBatchUploading(false);
+    if (pendingCount) {
+      onIngestEvent?.({
+        stage: 'pending_approval',
+        message: `${pendingCount} file${pendingCount === 1 ? '' : 's'} uploaded and waiting for approval.`,
+        meta: { file_name: batchLabel },
+      });
+      window.dispatchEvent(new Event('documents-pending'));
+    } else if (jobs.length) {
+      onIngestEvent?.({ stage: 'indexing', message: `${jobs.length} files queued safely for indexing.`, meta: { file_name: batchLabel } });
+    } else if (accepted) {
+      await onIngestComplete?.();
+    }
+    if (failed) setUploadError(`${failed} file${failed === 1 ? '' : 's'} could not be accepted. The remaining files were not interrupted.`);
+    if (jobs.length) monitorBatchJobs(jobs, batchLabel);
   };
 
   const [pendingDeleteSession, setPendingDeleteSession] = useState(null);
@@ -258,7 +297,7 @@ export default function ChatHistoryDrawer({
 
       {canUpload && <button
         type="button"
-        onClick={() => { setUploadError(''); setUploadOpen(true); }}
+        onClick={() => { setUploadError(''); setSelectedFiles([]); setBatchRows([]); setUploadOpen(true); }}
         disabled={isUploading}
         className="inline-flex items-center gap-2 text-xs border rounded-xl px-3 py-2 transition disabled:opacity-50"
         style={{ color: 'var(--dc-text-secondary)', background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)', cursor: isUploading ? 'not-allowed' : 'pointer' }}
@@ -268,31 +307,39 @@ export default function ChatHistoryDrawer({
       </button>}
 
       {uploadOpen && (
-        <div className="fixed inset-0 z-[100] grid place-items-center p-5" style={{ background: 'rgba(15,23,42,.36)', backdropFilter: 'blur(5px)' }} onClick={() => !isUploading && setUploadOpen(false)}>
+        <div className="fixed inset-0 z-[100] grid place-items-center p-5" style={{ background: 'rgba(15,23,42,.36)', backdropFilter: 'blur(5px)' }} onClick={() => !batchUploading && setUploadOpen(false)}>
           <section className="w-full max-w-lg rounded-2xl p-5" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border)', boxShadow: '0 24px 70px rgba(15,23,42,.22)' }} onClick={(event) => event.stopPropagation()}>
             <div className="flex items-start justify-between gap-3">
               <div className="flex gap-3">
                 <span className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: 'var(--dc-brand-dim)', color: 'var(--dc-brand)' }}><UploadCloud size={19} /></span>
                 <div><h2 className="text-sm font-semibold">Upload knowledge</h2><p className="text-[11px] mt-1" style={{ color: 'var(--dc-text-muted)' }}>{canSelfApprove ? 'Your role can index this file immediately.' : 'Files enter the approval queue before indexing.'}</p></div>
               </div>
-              <button type="button" onClick={() => setUploadOpen(false)} disabled={isUploading} className="p-1.5 rounded-lg" style={{ color: 'var(--dc-text-muted)' }} aria-label="Close upload dialog"><X size={16} /></button>
+              <button type="button" onClick={() => setUploadOpen(false)} disabled={batchUploading} className="p-1.5 rounded-lg" style={{ color: 'var(--dc-text-muted)' }} aria-label="Close upload dialog"><X size={16} /></button>
             </div>
 
             <div className="grid grid-cols-2 gap-2 my-4">
-              <div className="rounded-xl p-3 flex gap-2" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}><ShieldCheck size={15} style={{ color: 'var(--dc-green)' }} /><div><p className="text-[11px] font-semibold">Maximum 15MB</p><p className="text-[10px] mt-0.5" style={{ color: 'var(--dc-text-muted)' }}>Validated again by the API</p></div></div>
-              <div className="rounded-xl p-3 flex gap-2" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}><FileCheck2 size={15} style={{ color: 'var(--dc-brand)' }} /><div><p className="text-[11px] font-semibold">Approved formats</p><p className="text-[10px] mt-0.5" style={{ color: 'var(--dc-text-muted)' }}>PDF, MD, TXT, images and Office</p></div></div>
+              <div className="rounded-xl p-3 flex gap-2" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}><ShieldCheck size={15} style={{ color: 'var(--dc-green)' }} /><div><p className="text-[11px] font-semibold">Maximum 15MB each</p><p className="text-[10px] mt-0.5" style={{ color: 'var(--dc-text-muted)' }}>Files upload one at a time safely</p></div></div>
+              <div className="rounded-xl p-3 flex gap-2" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}><FileCheck2 size={15} style={{ color: 'var(--dc-brand)' }} /><div><p className="text-[11px] font-semibold">Mixed formats</p><p className="text-[10px] mt-0.5" style={{ color: 'var(--dc-text-muted)' }}>Documents, data, images and Office</p></div></div>
             </div>
 
-            <label className="block rounded-xl border border-dashed p-5 text-center cursor-pointer" style={{ borderColor: selectedFile ? 'var(--dc-brand)' : 'var(--dc-border-strong)', background: selectedFile ? 'var(--dc-brand-dim)' : 'var(--dc-surface-1)' }}>
-              <input type="file" accept=".pdf,.png,.jpg,.jpeg,.txt,.md,.puml,.mmd,.mermaid,.doc,.docx,.xls,.xlsx,.ppt,.pptx" className="hidden" disabled={isUploading} onChange={(event) => { setSelectedFile(event.target.files?.[0] || null); setUploadError(''); }} />
+            <label className="block rounded-xl border border-dashed p-5 text-center cursor-pointer" style={{ borderColor: selectedFiles.length ? 'var(--dc-brand)' : 'var(--dc-border-strong)', background: selectedFiles.length ? 'var(--dc-brand-dim)' : 'var(--dc-surface-1)' }}>
+              <input type="file" multiple className="hidden" disabled={batchUploading} onChange={(event) => { const files = Array.from(event.target.files || []); setSelectedFiles(files); setBatchRows(files.map((file) => { const error = uploadValidationError(file); return { file, status: error ? 'failed' : 'waiting', detail: error || 'Ready to upload' }; })); setUploadError(''); }} />
               <UploadCloud size={22} className="mx-auto mb-2" style={{ color: 'var(--dc-brand)' }} />
-              <p className="text-xs font-medium">{selectedFile ? selectedFile.name : 'Choose a file to upload'}</p>
-              <p className="text-[10px] mt-1" style={{ color: 'var(--dc-text-muted)' }}>{selectedFile ? `${(selectedFile.size / 1024 / 1024).toFixed(2)} MB` : 'PDF, Markdown, TXT, PNG, JPG, DOCX, XLSX, PPTX and diagrams'}</p>
+              <p className="text-xs font-medium">{selectedFiles.length ? `${selectedFiles.length} file${selectedFiles.length === 1 ? '' : 's'} selected` : 'Choose multiple files to upload'}</p>
+              <p className="text-[10px] mt-1" style={{ color: 'var(--dc-text-muted)' }}>{selectedFiles.length ? `${(selectedFiles.reduce((sum, file) => sum + file.size, 0) / 1024 / 1024).toFixed(2)} MB total` : 'You can mix PDF, text/data, images, Office and diagram files'}</p>
             </label>
+
+            {batchRows.length > 0 && <div className="mt-3 max-h-44 overflow-y-auto space-y-1.5 pr-1 custom-scrollbar">
+              {batchRows.map((row, index) => <div key={`${row.file.name}-${index}`} className="flex items-center gap-2 rounded-lg px-2.5 py-2" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}>
+                <span className="w-2 h-2 rounded-full shrink-0" style={{ background: row.status === 'failed' ? 'var(--dc-red)' : row.status === 'completed' ? 'var(--dc-green)' : row.status === 'pending' ? '#f59e0b' : 'var(--dc-brand)' }} />
+                <span className="min-w-0 flex-1 text-[11px] font-medium truncate">{row.file.name}</span>
+                <span className="max-w-[45%] text-[9px] text-right truncate" style={{ color: row.status === 'failed' ? 'var(--dc-red)' : 'var(--dc-text-muted)' }}>{row.detail}</span>
+              </div>)}
+            </div>}
 
             <label className="block text-[11px] font-medium mt-4">Minimum access level<select value={accessRole} onChange={(event) => setAccessRole(event.target.value)} className="w-full mt-1.5 rounded-lg px-3 py-2" style={{ background: 'var(--dc-surface-1)', color: 'var(--dc-text-primary)', border: '1px solid var(--dc-border)' }}><option value="viewer">Everyone in workspace</option><option value="member">Members and above</option>{['editor', 'admin', 'owner'].includes(user.role) && <option value="editor">Editors and above</option>}{['admin', 'owner'].includes(user.role) && <option value="admin">Admins and owner</option>}{user.role === 'owner' && <option value="owner">Owner only</option>}</select></label>
             {uploadError && <p className="text-[11px] mt-3 rounded-lg px-3 py-2" style={{ color: 'var(--dc-red)', background: 'rgba(244,63,94,.08)' }}>{uploadError}</p>}
-            <div className="flex justify-end gap-2 mt-5"><button type="button" onClick={() => setUploadOpen(false)} disabled={isUploading} className="px-4 py-2 rounded-lg text-xs" style={{ border: '1px solid var(--dc-border)' }}>Cancel</button><button type="button" onClick={() => handleUpload(selectedFile)} disabled={!selectedFile || isUploading} className="px-4 py-2 rounded-lg text-xs font-semibold disabled:opacity-50" style={{ background: 'var(--dc-brand)', color: 'white' }}>{isUploading ? 'Uploading…' : canSelfApprove ? 'Upload and index' : 'Upload for approval'}</button></div>
+            <div className="flex justify-end gap-2 mt-5"><button type="button" onClick={() => setUploadOpen(false)} disabled={batchUploading} className="px-4 py-2 rounded-lg text-xs" style={{ border: '1px solid var(--dc-border)' }}>{batchRows.some((row) => ['queued', 'pending', 'completed', 'failed'].includes(row.status)) ? 'Close' : 'Cancel'}</button><button type="button" onClick={() => handleUpload(selectedFiles)} disabled={!selectedFiles.length || batchUploading || batchRows.some((row) => ['uploading', 'queued', 'pending', 'completed'].includes(row.status))} className="px-4 py-2 rounded-lg text-xs font-semibold disabled:opacity-50" style={{ background: 'var(--dc-brand)', color: 'white' }}>{batchUploading ? 'Uploading safely…' : canSelfApprove ? `Upload ${selectedFiles.length || ''} and index` : `Upload ${selectedFiles.length || ''} for approval`}</button></div>
           </section>
         </div>
       )}

@@ -115,7 +115,7 @@ Backend API (FastAPI)
 
 ## End-to-End Flow
 
-1. Frontend uploads a file to `POST /upload` (maximum 15 MB).
+1. The frontend accepts a mixed multi-file selection and uploads each file sequentially to `POST /upload` (maximum 15 MB per file). Per-file validation and failure isolation keep one bad file from interrupting the rest of the batch.
 2. Backend stores the file in `backend/data` and registers it as `pending_approval`.
 3. Approve it with `POST /approve-document/{document_id}` to queue a Celery task. The worker runs ingestion via `Supervisor` -> `DataIngestor`.
 4. Content is chunked, diagram blocks are extracted, and records are indexed in Chroma.
@@ -135,6 +135,7 @@ Backend API (FastAPI)
 - **Meeting transcript path:** files containing `meeting` or `transcript` get summarized into structured records
 - **Session persistence:** chat sessions and message history stored in SQLite
 - **Slack ingestion:** `file_shared` events can trigger the same ingestion pipeline
+- **Nexconn file proposals:** any workspace role can share a file in chat; compatible files remain pending until an editor, admin, or owner chooses **Add to workspace**. Chat sharing does not bypass retrieval permissions or ingestion approval.
 
 ## Tech Stack
 
@@ -207,6 +208,9 @@ DeepContext/
 | File type               | Processing strategy                      |
 | ----------------------- | ---------------------------------------- |
 | `.txt`, `.md`           | Direct text load                         |
+| `.csv`, `.json`, `.jsonl` | Direct structured-text load            |
+| `.yaml`, `.yml`, `.xml` | Direct structured-text load              |
+| `.html`, `.htm`, `.log`, `.rst` | Direct text load                  |
 | `.puml`                 | Text load + PlantUML extraction          |
 | `.mmd`, `.mermaid`      | Text load + Mermaid extraction           |
 | Text PDFs               | Native PDF text extraction               |

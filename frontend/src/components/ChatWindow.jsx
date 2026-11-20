@@ -82,6 +82,7 @@ function normalizeHistoryPayload(payload) {
         return {
           index: s.index ?? s.chunkIndex ?? s.chunk_index ?? idx + 1,
           sourceName: s.sourceName ?? s.source_name ?? s.source ?? s.name ?? '',
+          displayName: s.displayName ?? s.display_name ?? '',
           preview: s.preview ?? s.raw_text_preview ?? '',
           page: s.page ?? s.page,
         };
@@ -476,7 +477,7 @@ export default function ChatWindow({
       : [];
   
     return (
-      <div className="flex-1 flex flex-col p-4 min-h-100 mx-auto w-full">
+      <div className="h-full min-h-0 flex-1 flex flex-col overflow-hidden p-4 mx-auto w-full">
         <ChatHistoryDrawer
           user={user}
           activeSessionId={effectiveSessionId}
@@ -507,7 +508,7 @@ export default function ChatWindow({
 
         <div
           ref={messagesContainerRef}
-          className="messagesBox flex-1 overflow-y-auto space-y-4 mb-4 pr-2 custom-scrollbar"
+          className="messagesBox min-h-0 flex-1 overflow-y-auto overflow-x-hidden space-y-4 mb-4 pr-2 custom-scrollbar"
         >
           {messages.length === 0 && !isTyping
             ? <WelcomeScreen onSuggestion={(text) => { setInput(text); }} />

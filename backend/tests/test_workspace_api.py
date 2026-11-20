@@ -171,6 +171,41 @@ class WorkspaceAPITests(unittest.TestCase):
         self.assertEqual(self.owner.post('/reject-document/foreign-document').status_code, 404)
         self.task.delay.assert_not_called()
 
+    def test_viewer_can_share_file_but_only_editor_can_add_it_to_workspace(self):
+        viewer = self.member_client('viewer', 'sharing-viewer@example.com')
+        original_open = open
+
+        def temporary_open(filename, mode='r', *args, **kwargs):
+            if mode == 'wb':
+                filename = Path(self.directory.name, Path(filename).name)
+            return original_open(filename, mode, *args, **kwargs)
+
+        with patch('builtins.open', side_effect=temporary_open), patch.object(self.api.os, 'makedirs'):
+            shared = viewer.post('/nexconn/share-file', files={
+                'file': ('team-notes.txt', b'Shared by a viewer', 'text/plain'),
+            })
+
+        self.assertEqual(shared.status_code, 201, shared.text)
+        document_id = shared.json()['document_id']
+        with auth.connect() as db:
+            row = db.execute('SELECT * FROM pending_uploads WHERE document_id=?', (document_id,)).fetchone()
+        self.assertEqual(row['team_id'], self.identity['workspace_id'])
+        self.assertEqual(row['access_level'], 0)
+        self.assertEqual(row['status'], 'pending_approval')
+        self.assertEqual(viewer.post(f'/approve-document/{document_id}').status_code, 403)
+
+        with patch.object(self.api.os.path, 'exists', return_value=True):
+            approved = self.owner.post(f'/approve-document/{document_id}')
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.task.delay.assert_called_once_with(
+            row['file_path'], team_id=self.identity['workspace_id'], access_level=0,
+        )
+
+        unsupported = viewer.post('/nexconn/share-file', files={
+            'file': ('unsafe.exe', b'not knowledge', 'application/octet-stream'),
+        })
+        self.assertEqual(unsupported.status_code, 415)
+
     def test_workspace_scoped_upload_assigns_access_and_safe_path(self):
         # Capture the saved file in a temporary directory, not the repository's runtime data.
         original_open = open

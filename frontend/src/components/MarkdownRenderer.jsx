@@ -30,7 +30,10 @@ function renderWithCitations(text, onHover, onLeave, highlightedIndex) {
 export default function MarkdownRenderer({ content, diagrams = [], sources = [] }) {
   const { highlightedIndex, onHover, onLeave } = useCitationHighlight();
 
-  const text = String(content ?? '').trim();
+  // Models sometimes put HTML-style breaks inside Markdown table cells.
+  // ReactMarkdown intentionally escapes raw HTML, so normalize those breaks
+  // into readable separators without breaking the GFM table row structure.
+  const text = String(content ?? '').replace(/<br\s*\/?>/gi, ' • ').trim();
   const hasText = Boolean(text);
   const hasDiagrams = Array.isArray(diagrams) && diagrams.length > 0;
 
@@ -42,6 +45,11 @@ export default function MarkdownRenderer({ content, diagrams = [], sources = [] 
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={{
+            table: ({ children }) => (
+              <div className="markdown-table-scroll custom-scrollbar" role="region" aria-label="Scrollable answer table" tabIndex={0}>
+                <table>{children}</table>
+              </div>
+            ),
             p: ({ children }) => (
               <p className="mb-3 whitespace-pre-wrap last:mb-0">
                 {React.Children.map(children, (child) => {

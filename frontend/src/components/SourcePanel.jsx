@@ -1,5 +1,6 @@
 import React from 'react';
 import { FileText } from 'lucide-react';
+import { sourceDisplayName } from '../utils/sourceName.util';
 
 export default function SourcePanel({ sources = [], highlightedIndex = null }) {
   if (!sources || sources.length === 0) return null;
@@ -24,7 +25,7 @@ export default function SourcePanel({ sources = [], highlightedIndex = null }) {
               <div className="flex items-center gap-2 mb-1">
                 <FileText size={12} className="" style={{ color: 'var(--dc-text-muted)' }} />
                 <span className="text-xs font-medium truncate" style={{ color: 'var(--dc-text-primary)' }}>
-                  {src.sourceName}
+                  {sourceDisplayName(src) || 'Unknown source'}
                 </span>
                 {src.page != null && (
                   <span className="text-[10px] shrink-0" style={{ color: 'var(--dc-text-muted)' }}>p.{src.page}</span>
