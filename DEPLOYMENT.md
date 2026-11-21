@@ -15,9 +15,12 @@ persistent disk. Those are either temporary or paid. The included
 
 > This is a hobby/demo deployment. Render sleeps after 15 idle minutes and the
 > next request can take about a minute. It has 512 MB RAM, an ephemeral disk,
-> and no free background worker. DeepContext therefore runs ingestion inside
-> the API request (`CELERY_TASK_ALWAYS_EAGER=true`). Upload small documents and
-> wait for each upload to finish.
+> and no free background worker. With `CELERY_TASK_ALWAYS_EAGER=true`,
+> DeepContext uses one bounded background thread inside the API container so
+> the upload request can return promptly without overlapping memory-heavy
+> ingestion jobs. This is suitable for a demo, but a container restart can
+> interrupt an active job. Upload small documents and wait for each upload to
+> finish before starting another one.
 
 ## 1. Push the project to GitHub
 
@@ -44,8 +47,10 @@ has appeared in a screenshot, terminal output, or Git history.
 5. Keep `sslmode=require` in the URL.
 
 DeepContext creates its relational tables, enables the `vector` extension, and
-creates the pgvector table on first startup. Every vector retains `team_id` and
-`access_level` metadata, so retrieval remains isolated by workspace and role.
+creates the pgvector table on first startup. Every vector retains a workspace
+identifier and normalized ACL metadata. PostgreSQL applies the workspace and
+ACL predicate before vector ordering and `LIMIT`, so restricted chunks never
+enter application memory or an LLM prompt.
 
 ### Create private upload storage in Neon
 
@@ -89,8 +94,8 @@ S3-compatible, no-card object-storage account available to you. Do not leave
 4. Open the database and find **Connect → Redis URL**.
 5. Copy the full TLS URL beginning with `rediss://`. This is `REDIS_URL`.
 
-The free deployment uses Redis for ingestion progress and Celery result state;
-it does not run a separate worker.
+The free deployment uses Redis for ingestion progress and eager-task result
+state; it does not run a separate worker.
 
 ## 4. Create the free Render API
 
@@ -130,6 +135,8 @@ AUTH_COOKIE_SAMESITE=none
 APP_ENV=production
 RERANK_ENABLED=false
 HUGGINGFACE_LOCAL_FILES_ONLY=true
+ACL_ENFORCEMENT_MODE=enforce
+ACL_AUTO_BACKFILL=true
 ```
 
 7. Select **Apply** and wait for the Docker build.
@@ -148,8 +155,34 @@ curl https://YOUR-API.onrender.com/health
 curl https://YOUR-API.onrender.com/health/chroma
 ```
 
-The second route keeps its old name for frontend compatibility, but its
-`endpoint` should be `postgresql+pgvector` in this deployment.
+The second route keeps its old name for frontend compatibility. Public health
+responses intentionally expose only `healthy`/`degraded`; they do not reveal
+database endpoints, collection names, or restricted document counts.
+
+### Existing-document ACL rollout
+
+The release is additive and does not drop or rename live tables. On startup it
+creates `workspace_groups`, `group_memberships`, `document_acl_entries`, and
+the append-only `retrieval_audit_log`. With `ACL_AUTO_BACKFILL=true`, it then
+copies each legacy document's minimum-role rule into normalized ACL tokens and
+updates vector metadata without recalculating embeddings. Documents with no
+legacy rule fail closed to `role:admin`. The operation is restart-safe and
+skips documents that already have normalized ACL rows.
+
+Before deploying a large existing corpus, review the migration locally or
+against a staging database (dry-run is the default):
+
+```bash
+cd backend
+python backfill_acl_entries.py
+python backfill_acl_entries.py --apply
+```
+
+For a shadow-observation deployment, temporarily set
+`ACL_ENFORCEMENT_MODE=shadow`; this continues using the legacy role predicate
+while ACL metadata is populated. Change it to `enforce` immediately after the
+backfill and isolation checks. New production deployments should start directly
+with `enforce`. Never use shadow mode as a steady-state configuration.
 
 ## 5. Deploy the frontend on Vercel Hobby
 
@@ -191,7 +224,8 @@ For multiple trusted origins, separate them with commas and do not use `*`.
 1. Open the Vercel URL in a private browser window.
 2. Create a workspace and sign in.
 3. Upload one small `.txt` or text PDF (start below 3 MB).
-4. Wait for ingestion to finish; free mode performs it synchronously.
+4. Wait for ingestion to finish; free mode processes one background ingestion
+   job at a time in the API container.
 5. Ask a question whose answer is clearly present in that file.
 6. Confirm the citation uses the real uploaded filename.
 7. Create a second workspace and confirm its documents/citations are not
@@ -267,6 +301,9 @@ URL as `REDIS_URL`.
 - [ ] Private S3-compatible storage is configured; uploads are not local.
 - [ ] Vercel has only `VITE_API_BASE_URL`.
 - [ ] Render has the exact Vercel origin in `AUTH_ALLOWED_ORIGINS`.
+- [ ] `ACL_ENFORCEMENT_MODE=enforce` and `ACL_AUTO_BACKFILL=true` are set.
+- [ ] An intern cannot retrieve an HR-only test document, including by exact title.
+- [ ] Removing a test group membership removes access on the next request.
 - [ ] A small upload, cited answer, and second-workspace isolation test pass.
 
 ## Official plan references

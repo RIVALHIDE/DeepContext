@@ -14,6 +14,8 @@ if importlib.util.find_spec('jwt') is None:
 from fastapi.testclient import TestClient
 import auth
 import database
+from acl_security import minimum_role_acl
+import json
 
 
 class WorkspaceAPITests(unittest.TestCase):
@@ -31,8 +33,7 @@ class WorkspaceAPITests(unittest.TestCase):
         self.engine = MagicMock()
         self.engine.get_answer.return_value = {'answer': 'Workspace answer', 'sources': [], 'retrieved': False}
         self.engine._build_answer_request.return_value = {'mode': 'no_docs', 'answer': 'No documents yet', 'sources': [], 'retrieved': False}
-        self.task = MagicMock()
-        self.task.delay.return_value = SimpleNamespace(id='test-job')
+        self.task = MagicMock(return_value='test-job')
         engine = self.engine
         class FakeEngine:
             def __new__(cls):
@@ -41,7 +42,7 @@ class WorkspaceAPITests(unittest.TestCase):
         stubs = {
             'rag_engine': SimpleNamespace(DeepContextEngine=FakeEngine, _normalize_markdown_answer=lambda value: value),
             'supervisor': SimpleNamespace(Supervisor=MagicMock()),
-            'celery_worker': SimpleNamespace(process_document_task=self.task, app=MagicMock()),
+            'celery_worker': SimpleNamespace(enqueue_document_task=self.task, app=MagicMock()),
         }
         patcher = patch.dict(sys.modules, stubs)
         patcher.start()
@@ -75,7 +76,11 @@ class WorkspaceAPITests(unittest.TestCase):
         workspace = self.identity['workspace_id']
         with auth.connect() as db:
             for source, workspace_id, level in [('alpha-public.md', workspace, 0), ('alpha-secret.md', workspace, 2), ('beta.md', 'different-workspace', 0), ('legacy.md', 'default', 0)]:
-                db.execute('INSERT INTO documents (document_id, source_name, workspace_id) VALUES (?, ?, ?)', (source, source, workspace_id))
+                role = {0: 'viewer', 2: 'admin'}[level]
+                db.execute(
+                    'INSERT INTO documents (document_id, source_name, workspace_id, acl_entries) VALUES (?, ?, ?, ?)',
+                    (source, source, workspace_id, json.dumps(minimum_role_acl(role))),
+                )
                 db.execute('INSERT INTO document_access VALUES (?, ?, ?)', (source, workspace_id, level))
         viewer = self.member_client()
         self.assertEqual([doc['name'] for doc in viewer.get('/retriveAllDocuments').json()['files']], ['alpha-public.md'])
@@ -96,11 +101,16 @@ class WorkspaceAPITests(unittest.TestCase):
         session = self.session_id(self.identity)
         response = self.owner.post('/get-answer', json={'question': 'Hello', 'sessionId': session, 'userTeam': 'different-workspace|3'})
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(self.engine.get_answer.call_args.kwargs['user_team'], self.identity['workspace_id'] + '|3')
+        resolved = self.engine.get_answer.call_args.kwargs['user_team']
+        self.assertEqual(resolved['workspace_id'], self.identity['workspace_id'])
+        self.assertEqual(resolved['user_id'], self.identity['id'])
         streamed = self.owner.post('/get-answer/stream', json={'question': 'Hello', 'sessionId': session, 'userTeam': 'default'})
         self.assertEqual(streamed.status_code, 200, streamed.text)
         self.assertIn('event: done', streamed.text)
-        self.assertEqual(self.engine._build_answer_request.call_args.kwargs['team_id'], self.identity['workspace_id'] + '|3')
+        self.assertEqual(
+            self.engine._build_answer_request.call_args.kwargs['team_id']['workspace_id'],
+            self.identity['workspace_id'],
+        )
 
     def test_stream_reflects_before_releasing_answer_tokens(self):
         class DraftChain:
@@ -169,7 +179,7 @@ class WorkspaceAPITests(unittest.TestCase):
                           VALUES ('foreign-document', 'foreign.txt', '/not/read', 10, 'other-workspace')''')
         self.assertEqual(self.owner.post('/approve-document/foreign-document').status_code, 404)
         self.assertEqual(self.owner.post('/reject-document/foreign-document').status_code, 404)
-        self.task.delay.assert_not_called()
+        self.task.assert_not_called()
 
     def test_viewer_can_share_file_but_only_editor_can_add_it_to_workspace(self):
         viewer = self.member_client('viewer', 'sharing-viewer@example.com')
@@ -190,15 +200,17 @@ class WorkspaceAPITests(unittest.TestCase):
         with auth.connect() as db:
             row = db.execute('SELECT * FROM pending_uploads WHERE document_id=?', (document_id,)).fetchone()
         self.assertEqual(row['team_id'], self.identity['workspace_id'])
-        self.assertEqual(row['access_level'], 0)
+        self.assertEqual(row['access_level'], 2)
         self.assertEqual(row['status'], 'pending_approval')
         self.assertEqual(viewer.post(f'/approve-document/{document_id}').status_code, 403)
 
         with patch.object(self.api.os.path, 'exists', return_value=True):
             approved = self.owner.post(f'/approve-document/{document_id}')
         self.assertEqual(approved.status_code, 200, approved.text)
-        self.task.delay.assert_called_once_with(
-            row['file_path'], team_id=self.identity['workspace_id'], access_level=0,
+        self.task.assert_called_once_with(
+            row['file_path'], team_id=self.identity['workspace_id'], access_level=2,
+            uploader_id=row['uploaded_by'], uploader_name='Viewer', uploader_team='Alpha',
+            acl_entries=['role:admin'],
         )
 
         unsupported = viewer.post('/nexconn/share-file', files={
@@ -228,8 +240,10 @@ class WorkspaceAPITests(unittest.TestCase):
         self.assertEqual(Path(row['file_path']).name, self.identity['workspace_id'] + '__policy.txt')
         self.assertNotIn('..', row['file_path'])
         self.assertEqual(row['uploaded_by'], self.identity['id'])
-        self.task.delay.assert_called_once_with(
+        self.task.assert_called_once_with(
             row['file_path'], team_id=self.identity['workspace_id'], access_level=2,
+            uploader_id=self.identity['id'], uploader_name='Owner', uploader_team='Alpha',
+            acl_entries=['role:admin', 'role:owner'],
         )
 
     def test_editor_and_admin_uploads_are_self_approved_at_their_clearance(self):
@@ -258,8 +272,8 @@ class WorkspaceAPITests(unittest.TestCase):
                 self.assertEqual(row['status'], 'approved')
                 self.assertEqual(row['approved_by'], client.get('/auth/me').json()['user']['id'])
                 self.assertEqual(response.json()['status'], 'processing')
-                self.task.delay.assert_called_once()
-                self.task.delay.reset_mock()
+                self.task.assert_called_once()
+                self.task.reset_mock()
 
     def test_member_upload_waits_for_approval_at_member_clearance(self):
         member = self.member_client('member')
@@ -284,7 +298,7 @@ class WorkspaceAPITests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row['access_level'], 1)
         self.assertEqual(row['status'], 'pending_approval')
-        self.task.delay.assert_not_called()
+        self.task.assert_not_called()
 
     def test_role_hierarchy_enforces_document_and_member_management_boundaries(self):
         clients = {

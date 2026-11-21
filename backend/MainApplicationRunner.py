@@ -5,15 +5,16 @@ import requests
 import asyncio
 import uuid
 import re
+import logging
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
-from celery_worker import process_document_task
+from celery_worker import enqueue_document_task
 from celery.result import AsyncResult
 from chat_history_manager import ChatHistroyManager
 from chat_session_manager import ChatSessionManager
 from database import initDB
-from fastapi import FastAPI,File,UploadFile,HTTPException,Form
+from fastapi import FastAPI,File,UploadFile,HTTPException,Form,Response
 from fastapi.middleware.cors import CORSMiddleware
 from auth import (install_auth, current, require_role, session_owner, retrieval_scope, retrieval_filter,
                   connect as auth_connect, ROLES)
@@ -37,9 +38,28 @@ from document_registry import (
 from object_storage import delete as delete_staged_file, exists as staged_file_exists, store_upload
 from rag_engine import DeepContextEngine, _normalize_markdown_answer
 from webhook import router as nexconn_router
+from workspace_leaderboard import (
+    award_approved_upload,
+    award_cited_sources,
+    get_workspace_leaderboard,
+    upload_contributor,
+)
+from backfill_acl_entries import run as backfill_acl_entries
+from acl_security import (
+    DEFAULT_ACL,
+    acl_display_role,
+    can_access_acl,
+    document_acl,
+    effective_acl_scope,
+    minimum_role_acl,
+    normalize_acl_entries,
+    record_retrieval_audit,
+    sync_vector_acl,
+)
 
 
 SLACK_BOT_TOKEN=os.getenv("SLACK_BOT_TOKEN")
+logger = logging.getLogger(__name__)
 
 # ── Upload validation constants ─────────────────────────────────────────────
 MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
@@ -108,6 +128,51 @@ class UserRequest(BaseModel):
     replaceHumanTurn: int | None = Field(default=None, ge=0)
 
 
+UNAVAILABLE_SOURCE_SENTINEL = "__no_permitted_selected_source__"
+
+
+def _validate_acl_references(entries: list[str], actor: dict) -> list[str]:
+    """Validate user/group/role ACL targets inside the active workspace."""
+    user_ids = [token.split(':', 1)[1] for token in entries if token.startswith('user:')]
+    group_ids = [token.split(':', 1)[1] for token in entries if token.startswith('group:')]
+    role_ids = [token.split(':', 1)[1] for token in entries if token.startswith('role:')]
+    if any(role not in {*ROLES, 'curator'} for role in role_ids):
+        raise HTTPException(422, 'ACL contains an unknown workspace role')
+    with auth_connect() as database:
+        valid_users = {
+            row['user_id'] for row in database.execute(
+                'SELECT user_id FROM memberships WHERE workspace_id=?',
+                (actor['workspace_id'],),
+            )
+        }
+        valid_groups = {
+            row['id'] for row in database.execute(
+                'SELECT id FROM workspace_groups WHERE workspace_id=?',
+                (actor['workspace_id'],),
+            )
+        }
+    if not set(user_ids).issubset(valid_users) or not set(group_ids).issubset(valid_groups):
+        raise HTTPException(422, 'ACL references a user or group outside this workspace')
+    return entries
+
+
+def _upload_acl(access_role: str, raw_acl: str, actor: dict) -> tuple[list[str], str]:
+    """Resolve upload permissions without trusting client identity claims."""
+    if str(raw_acl or '').strip():
+        if ROLES[actor['role']] < ROLES['editor']:
+            raise HTTPException(403, 'Editor access is required to assign custom ACL entries')
+        try:
+            entries = normalize_acl_entries(raw_acl)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return _validate_acl_references(entries, actor), access_role or 'admin'
+    if access_role:
+        if access_role not in ROLES or ROLES[access_role] > ROLES[actor['role']]:
+            raise HTTPException(403, 'You cannot grant document access above your own role')
+        return minimum_role_acl(access_role), access_role
+    return list(DEFAULT_ACL), 'admin'
+
+
 def _apply_chat_branch(request: UserRequest):
     """Make edits and retries replace an existing turn instead of duplicating it."""
     if request.replaceHumanTurn is not None:
@@ -127,16 +192,16 @@ def _validated_selected_sources(requested_sources: list[str], actor: dict) -> li
     if not requested:
         return []
 
-    with auth_connect() as db:
-        rows = db.execute(
-            '''SELECT source_name FROM document_access
-               WHERE workspace_id=? AND access_level<=?''',
-            (actor['workspace_id'], ROLES[actor['role']]),
-        ).fetchall()
-    permitted = {str(row['source_name']).casefold(): str(row['source_name']) for row in rows}
+    scope = effective_acl_scope(actor)
+    permitted = {
+        str(record['source_name']).casefold(): str(record['source_name'])
+        for record in list_documents(actor['workspace_id'])
+        if can_access_acl(scope, record.get('acl_entries'))
+    }
     unavailable = [source for source in requested if source not in permitted]
     if unavailable:
-        raise HTTPException(403, 'One or more tagged files are unavailable at your access level.')
+        # Do not disclose whether a named document exists but is restricted.
+        return [UNAVAILABLE_SOURCE_SENTINEL]
     return [permitted[source] for source in requested]
 
 
@@ -178,6 +243,16 @@ def bootstrap_app():
         f"Chroma bootstrap OK | collection={chroma_status.get('collection_name')} | "
         f"documents={chroma_status.get('document_count', 0)}"
     )
+    if os.getenv('ACL_AUTO_BACKFILL', 'true').strip().lower() in {'1', 'true', 'yes'}:
+        acl_backfill = backfill_acl_entries(
+            apply=True, vector_db=engine.get_vector_db(refresh=True),
+        )
+        print(
+            "ACL metadata backfill OK | "
+            f"documents={acl_backfill['documents_updated']} | "
+            f"chunks={acl_backfill['chunks_updated']} | "
+            f"admin_defaults={acl_backfill['defaults_to_admin']}"
+        )
     migration = migrate_legacy_duplicate_chunks(engine.get_vector_db(refresh=True))
     if migration["stale_chunks_deleted"] or migration["documents_processed"]:
         print(
@@ -195,17 +270,26 @@ def health_check():
         "status": "healthy" if healthy else "degraded",
         "services": {
             "api": "healthy",
-            "chroma": chroma,
+            # This endpoint is intentionally unauthenticated for Render health
+            # checks. Never expose document counts, collection names, errors,
+            # or connection details here: they can reveal restricted data or
+            # infrastructure to anonymous callers.
+            "vector_store": "healthy" if healthy else "degraded",
         },
     }
 
 
 @app.get("/health/chroma")
 def chroma_health_check():
-    return check_chroma_health()
+    chroma = check_chroma_health()
+    return {"status": "healthy" if chroma.get("status") == "healthy" else "degraded"}
 
 @app.post("/upload")
-async def upload_docs(file: UploadFile = File(...), access_role: str = Form("")):
+async def upload_docs(
+    file: UploadFile = File(...),
+    access_role: str = Form(""),
+    acl_entries: str = Form(""),
+):
     """
     Hardened upload endpoint.
 
@@ -215,9 +299,7 @@ async def upload_docs(file: UploadFile = File(...), access_role: str = Form(""))
     """
 
     actor = require_role('member')
-    access_role = access_role or actor['role']
-    if access_role not in ROLES or ROLES[access_role] > ROLES[actor['role']]:
-        raise HTTPException(403, 'You cannot grant document access above your own role')
+    document_acl_entries, compatibility_role = _upload_acl(access_role, acl_entries, actor)
     # ── File size validation ──
     content = await file.read()
     file_size = len(content)
@@ -247,9 +329,16 @@ async def upload_docs(file: UploadFile = File(...), access_role: str = Form(""))
         raise HTTPException(422, 'A valid filename is required')
     source_name = f"{actor['workspace_id']}__{safe_name}"
     document_id = str(uuid.uuid4())
-    file_path = store_upload(
-        content, actor['workspace_id'], document_id, source_name, mime_type or ext
-    )
+    try:
+        file_path = store_upload(
+            content, actor['workspace_id'], document_id, source_name, mime_type or ext
+        )
+    except Exception as exc:
+        logger.exception("Object storage rejected upload for workspace %s", actor['workspace_id'])
+        raise HTTPException(
+            503,
+            "Upload storage is unavailable. Check the Render S3_* environment variables.",
+        ) from exc
 
     # ── Register the upload before either approval or immediate ingestion ──
     try:
@@ -261,29 +350,36 @@ async def upload_docs(file: UploadFile = File(...), access_role: str = Form(""))
             mime_type=mime_type or ext,
             uploaded_by=actor["id"],
             team_id=actor["workspace_id"],
+            acl_entries=document_acl_entries,
         )
     except Exception:
         delete_staged_file(file_path)
         raise
 
     with auth_connect() as db:
-        db.execute('UPDATE pending_uploads SET access_level=? WHERE document_id=?', (ROLES[access_role], document_id))
+        db.execute('UPDATE pending_uploads SET access_level=? WHERE document_id=?',
+                   (ROLES[compatibility_role], document_id))
 
     if ROLES[actor['role']] >= ROLES['editor']:
-        task = process_document_task.delay(
+        job_id = enqueue_document_task(
             file_path,
             team_id=actor['workspace_id'],
-            access_level=ROLES[access_role],
+            access_level=ROLES[compatibility_role],
+            uploader_id=actor['id'],
+            uploader_name=actor['name'],
+            uploader_team=actor['workspace_name'],
+            acl_entries=document_acl_entries,
         )
-        approve_pending_upload(document_id, approved_by=actor['id'], job_id=task.id)
+        if approve_pending_upload(document_id, approved_by=actor['id'], job_id=job_id):
+            award_approved_upload(get_pending_upload(document_id))
         return {
             "message": "Upload successful. Ingestion started.",
             "document_id": document_id,
-            "job_id": task.id,
+            "job_id": job_id,
             "status": "processing",
             "file_name": file.filename,
             "file_size": file_size,
-            "access_role": access_role,
+            "access_role": compatibility_role,
         }
 
     return {
@@ -292,7 +388,7 @@ async def upload_docs(file: UploadFile = File(...), access_role: str = Form(""))
         "status": "pending_approval",
         "file_name": file.filename,
         "file_size": file_size,
-        "access_role": access_role,
+        "access_role": compatibility_role,
     }
 
 
@@ -318,10 +414,17 @@ async def stage_nexconn_shared_file(file: UploadFile = File(...)):
 
     document_id = str(uuid.uuid4())
     source_name = f"{actor['workspace_id']}__{safe_name}"
-    file_path = store_upload(
-        content, actor['workspace_id'], document_id, source_name,
-        file.content_type or extension,
-    )
+    try:
+        file_path = store_upload(
+            content, actor['workspace_id'], document_id, source_name,
+            file.content_type or extension,
+        )
+    except Exception as exc:
+        logger.exception("Object storage rejected Nexconn share for workspace %s", actor['workspace_id'])
+        raise HTTPException(
+            503,
+            "Attachment storage is unavailable. Check the Render S3_* environment variables.",
+        ) from exc
 
     try:
         create_pending_upload(
@@ -332,6 +435,7 @@ async def stage_nexconn_shared_file(file: UploadFile = File(...)):
             mime_type=file.content_type or extension,
             uploaded_by=actor['id'],
             team_id=actor['workspace_id'],
+            acl_entries=DEFAULT_ACL,
         )
     except Exception:
         delete_staged_file(file_path)
@@ -339,7 +443,7 @@ async def stage_nexconn_shared_file(file: UploadFile = File(...)):
     with auth_connect() as database:
         database.execute(
             'UPDATE pending_uploads SET access_level=? WHERE document_id=?',
-            (ROLES['viewer'], document_id),
+            (ROLES['admin'], document_id),
         )
     return {
         'document_id': document_id,
@@ -375,7 +479,6 @@ def get_pending_documents():
     actor = current()
     pending = [record for record in list_pending_uploads()
                if record.get('team_id') == actor['workspace_id']
-               and record.get('access_level', 0) <= ROLES[actor['role']]
                and (ROLES[actor['role']] >= ROLES['editor'] or record.get('uploaded_by') == actor['id'])]
     for record in pending:
         record['display_name'] = record['source_name'].split('__', 1)[-1]
@@ -395,8 +498,6 @@ def approve_document(document_id: str):
     record = get_pending_upload(document_id)
     if not record or record.get('team_id') != actor['workspace_id']:
         raise HTTPException(status_code=404, detail=f"Pending document not found: {document_id}")
-    if record.get('access_level', 0) > ROLES[actor['role']]:
-        raise HTTPException(403, 'Document access denied')
     if record.get("status") != "pending_approval":
         raise HTTPException(status_code=400, detail=f"Document is not pending (status={record.get('status')})")
 
@@ -405,13 +506,23 @@ def approve_document(document_id: str):
         raise HTTPException(status_code=404, detail="The staged upload could not be found in object storage.")
 
     team_id = record.get("team_id", "default")
-    task = process_document_task.delay(file_path, team_id=team_id, access_level=record.get('access_level', 0))
-    approve_pending_upload(document_id, approved_by=actor['id'], job_id=task.id)
+    contributor = upload_contributor(record) or {}
+    job_id = enqueue_document_task(
+        file_path,
+        team_id=team_id,
+        access_level=record.get('access_level', 0),
+        uploader_id=contributor.get('user_id', ''),
+        uploader_name=contributor.get('user_name', ''),
+        uploader_team=contributor.get('team_name', ''),
+        acl_entries=record.get('acl_entries'),
+    )
+    if approve_pending_upload(document_id, approved_by=actor['id'], job_id=job_id):
+        award_approved_upload(record)
 
     return {
         "message": "Document approved. Ingestion started in background.",
         "document_id": document_id,
-        "job_id": task.id,
+        "job_id": job_id,
     }
 
 
@@ -420,7 +531,7 @@ def reject_document(document_id: str):
     """Reject a pending document and remove it from the queue."""
     actor = require_role('editor')
     record = get_pending_upload(document_id)
-    if not record or record.get('team_id') != actor['workspace_id'] or record.get('access_level', 0) > ROLES[actor['role']]:
+    if not record or record.get('team_id') != actor['workspace_id']:
         raise HTTPException(404, 'Pending document not found')
     rejected = reject_pending_upload(document_id)
     if not rejected:
@@ -437,7 +548,9 @@ def authorize_job(job_id):
     actor = current()
     with auth_connect() as db:
         row = db.execute('SELECT * FROM pending_uploads WHERE job_id=? AND team_id=?', (job_id, actor['workspace_id'])).fetchone()
-    if not row or row['access_level'] > ROLES[actor['role']]:
+    if not row or (
+        row['uploaded_by'] != actor['id'] and ROLES[actor['role']] < ROLES['editor']
+    ):
         raise HTTPException(404, 'Job not found')
 
 
@@ -486,26 +599,25 @@ async def job_progress_stream(job_id: str):
 @app.get("/retriveAllDocuments")
 def getAllDocuments():
     actor = current()
-    with auth_connect() as db:
-        permitted = {row['source_name']: row['access_level'] for row in db.execute(
-            'SELECT source_name, access_level FROM document_access WHERE workspace_id=? AND access_level<=?',
-            (actor['workspace_id'], ROLES[actor['role']]))}
-    records = [record for record in list_documents(actor['workspace_id']) if record['source_name'] in permitted]
+    scope = effective_acl_scope(actor)
+    records = [
+        record for record in list_documents(actor['workspace_id'])
+        if can_access_acl(scope, record.get('acl_entries'))
+    ]
     return {'message': 'Success', 'files': [
         {'name': record['source_name'], 'displayName': record['source_name'].split('__', 1)[-1],
          'status': record['status'], 'time': record['ingested_at'], 'version': record['current_version'],
          'chunkCount': len(record.get('chunk_ids') or []),
-         'accessRole': next(role for role, value in ROLES.items() if value == permitted[record['source_name']])}
+         'accessRole': acl_display_role(record.get('acl_entries')), 'aclEntries': record.get('acl_entries', [])}
         for record in records]}
 
 
 @app.delete("/deleteDocument/{sourceName}")
 def deleteDocument(sourceName: str):
     actor = require_role('editor')
-    with auth_connect() as db:
-        allowed = db.execute('SELECT 1 FROM document_access WHERE source_name=? AND workspace_id=? AND access_level<=?',
-                             (sourceName.casefold(), actor['workspace_id'], ROLES[actor['role']])).fetchone()
-    if not allowed:
+    record = next((item for item in list_documents(actor['workspace_id'])
+                   if item['source_name'] == sourceName.casefold()), None)
+    if not record or not can_access_acl(effective_acl_scope(actor), record.get('acl_entries')):
         raise HTTPException(404, 'Document not found')
     try:
         vector_db = engine.get_vector_db(refresh=True)
@@ -532,41 +644,76 @@ def deleteDocument(sourceName: str):
 
 
 class DocumentAccessUpdate(BaseModel):
-    access_role: str
+    access_role: str | None = None
+    acl_entries: list[str] | None = None
 
 
 @app.patch('/documents/{sourceName}/access')
 def update_document_access(sourceName: str, payload: DocumentAccessUpdate):
     actor = require_role('editor')
-    if payload.access_role not in ROLES or ROLES[payload.access_role] > ROLES[actor['role']]:
-        raise HTTPException(403, 'Cannot assign this access level')
-    with auth_connect() as db:
-        record = db.execute('SELECT * FROM document_access WHERE source_name=? AND workspace_id=?',
-                            (sourceName.casefold(), actor['workspace_id'])).fetchone()
-    if not record or record['access_level'] > ROLES[actor['role']]:
+    record = next((item for item in list_documents(actor['workspace_id'])
+                   if item['source_name'] == sourceName.casefold()), None)
+    if not record or not can_access_acl(effective_acl_scope(actor), record.get('acl_entries')):
         raise HTTPException(404, 'Document not found')
+    if payload.acl_entries is not None:
+        try:
+            entries = normalize_acl_entries(payload.acl_entries)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        entries = _validate_acl_references(entries, actor)
+    elif payload.access_role:
+        if payload.access_role not in ROLES or ROLES[payload.access_role] > ROLES[actor['role']]:
+            raise HTTPException(403, 'Cannot assign this access level')
+        entries = minimum_role_acl(payload.access_role)
+    else:
+        entries = list(DEFAULT_ACL)
     vector_db = engine.get_vector_db(refresh=True)
-    snapshot = vector_db.get(where={'$and': [{'source_name': sourceName.casefold()}, {'team_id': actor['workspace_id']}]})
-    if not snapshot['ids']:
-        raise HTTPException(409, 'Document has not finished indexing')
-    metadata = [{**item, 'access_level': ROLES[payload.access_role]} for item in snapshot['metadatas']]
-    vector_db._collection.update(ids=snapshot['ids'], metadatas=metadata)
-    with auth_connect() as db:
-        db.execute('UPDATE document_access SET access_level=? WHERE source_name=? AND workspace_id=?',
-                   (ROLES[payload.access_role], sourceName.casefold(), actor['workspace_id']))
-    return {'message': 'Document access updated'}
+    updated_chunks = sync_vector_acl(
+        vector_db, actor['workspace_id'], record['document_id'], entries,
+    )
+    if payload.access_role:
+        with auth_connect() as db:
+            db.execute('UPDATE document_access SET access_level=? WHERE source_name=? AND workspace_id=?',
+                       (ROLES[payload.access_role], sourceName.casefold(), actor['workspace_id']))
+    return {'message': 'Document access updated', 'acl_entries': entries, 'updated_chunks': updated_chunks}
 
 
 def visible_history(session_id):
     actor = current()
-    with auth_connect() as db:
-        permitted = {row['source_name'] for row in db.execute(
-            'SELECT source_name FROM document_access WHERE workspace_id=? AND access_level<=?',
-            (actor['workspace_id'], ROLES[actor['role']]))}
+    scope = effective_acl_scope(actor)
+    permitted = {
+        record['source_name'] for record in list_documents(actor['workspace_id'])
+        if can_access_acl(scope, record.get('acl_entries'))
+    }
     history = history_manager.get_history(session_id)
-    return [message for message in history if message.get('role') != 'ai' or all(
-        str(source.get('sourceName', '')).casefold() in permitted
-        for source in message.get('sources', []))]
+    visible = []
+    for message in history:
+        if message.get('role') != 'ai':
+            visible.append(message)
+            continue
+        sources = message.get('sources') or []
+        # Legacy AI turns without provenance cannot be proven safe after a
+        # permission change, so they fail closed and are not sent to the LLM.
+        if message.get('retrieval_grounded') == 0:
+            visible.append(message)
+        elif sources and all(
+            str(source.get('sourceName', '')).casefold() in permitted
+            for source in sources
+        ):
+            visible.append(message)
+    return visible
+
+
+@app.get("/api/workspaces/{workspace_id}/leaderboard")
+def workspace_leaderboard(workspace_id: str, response: Response):
+    actor = current()
+    if workspace_id != actor['workspace_id']:
+        raise HTTPException(403, 'Switch to this workspace before viewing its leaderboard')
+    response.headers['Cache-Control'] = 'private, no-store'
+    return {
+        'workspace_id': workspace_id,
+        'leaders': get_workspace_leaderboard(workspace_id, limit=10),
+    }
 
 
 def authorize_session(session_id, allow_new=False):
@@ -655,6 +802,7 @@ def _save_ai_response(session_id: str, answer_text: str, diagrams: list, was_ret
         answer_text,
         diagrams=diagrams,
         sources=sources,
+        retrieval_grounded=was_retrieved,
     )
     session_manager.update_session(
         session_owner(),
@@ -663,6 +811,36 @@ def _save_ai_response(session_id: str, answer_text: str, diagrams: list, was_ret
         last_message_preview=answer_text or ("Diagram response" if diagrams else "No response was generated."),
     )
     return True
+
+
+def _public_sources(sources: list | None) -> list:
+    """Never expose internal uploader metadata through citation responses/history."""
+    return [
+        {key: value for key, value in source.items() if not str(key).startswith('_')}
+        for source in (sources or [])
+        if isinstance(source, dict)
+    ]
+
+
+def _save_scored_ai_response(
+    session_id: str,
+    answer_text: str,
+    diagrams: list,
+    was_retrieved: bool,
+    actor: dict,
+    sources: list | None = None,
+) -> list:
+    public_sources = _public_sources(sources)
+    saved = _save_ai_response(
+        session_id,
+        answer_text,
+        diagrams,
+        was_retrieved,
+        sources=public_sources,
+    )
+    if saved and was_retrieved and sources:
+        award_cited_sources(actor['workspace_id'], sources, uuid.uuid4().hex)
+    return public_sources
 
 @app.post("/get-answer")
 def get_answer(question: UserRequest):
@@ -677,6 +855,7 @@ def get_answer(question: UserRequest):
     history = visible_history(question.sessionId)
     clearance = query_clearance(question.question, actor['role'])
     if not clearance['allowed']:
+        record_retrieval_audit(question.userTeam, question.question, [])
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         history_manager.save_messages(question.sessionId, "human", question.question)
         session_manager.update_session(
@@ -735,12 +914,15 @@ def get_answer(question: UserRequest):
         last_message_preview=question.question
     )
   
-    _save_ai_response(question.sessionId, answer_text, diagrams, was_retrieved, sources=sources_to_save)
+    public_sources = _save_scored_ai_response(
+        question.sessionId, answer_text, diagrams, was_retrieved, actor,
+        sources=sources_to_save,
+    )
 
     return {
         "answer": answer_text,
         "diagrams": diagrams,
-        "sources": sources,
+        "sources": public_sources,
         "citation_names": citation_names,
     }
 
@@ -767,6 +949,7 @@ async def get_answer_stream(question: UserRequest):
     )
 
     if not clearance['allowed']:
+        record_retrieval_audit(question.userTeam, question.question, [])
         answer_text = clearance['message']
         _save_ai_response(question.sessionId, answer_text, [], False, sources=[])
 
@@ -839,11 +1022,14 @@ async def get_answer_stream(question: UserRequest):
             else:
                 sources_to_save = []
 
-            _save_ai_response(question.sessionId, answer_text, diagrams, was_retrieved, sources=sources_to_save)
+            public_sources = _save_scored_ai_response(
+                question.sessionId, answer_text, diagrams, was_retrieved, actor,
+                sources=sources_to_save,
+            )
             yield _build_sse_event("done", {
                 "answer": answer_text,
                 "diagrams": diagrams,
-                "sources": sources,
+                "sources": public_sources,
                 "citation_names": citation_names,
                 "retrieved": was_retrieved,
             })
@@ -888,12 +1074,15 @@ async def get_answer_stream(question: UserRequest):
             answer_text = fallback.get("answer", "")
             diagrams = fallback.get("diagrams", [])
             sources = fallback.get("sources", [])
-            _save_ai_response(question.sessionId, answer_text, diagrams, True, sources=sources)
+            public_sources = _save_scored_ai_response(
+                question.sessionId, answer_text, diagrams, True, actor,
+                sources=sources,
+            )
             for token in re.findall(r"\S+\s*|\s+", answer_text):
                 yield _build_sse_event("token", {"token": token})
             yield _build_sse_event("done", {
                 "answer": answer_text, "diagrams": diagrams,
-                "sources": sources,
+                "sources": public_sources,
                 "retrieved": True, "fallback": True,
             })
             return
@@ -949,11 +1138,14 @@ async def get_answer_stream(question: UserRequest):
         else:
             sources_to_save = []
 
-        _save_ai_response(question.sessionId, answer_text, diagrams, True, sources=sources_to_save)
+        public_sources = _save_scored_ai_response(
+            question.sessionId, answer_text, diagrams, True, actor,
+            sources=sources_to_save,
+        )
         yield _build_sse_event("done", {
             "answer": answer_text,
             "diagrams": diagrams,
-            "sources": sources,
+            "sources": public_sources,
             "citation_names": citation_names,
             "retrieved": True,
         })

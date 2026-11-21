@@ -72,6 +72,58 @@ def metadata_matches(metadata: dict, where: dict | None) -> bool:
     return True
 
 
+def _where_sql(where: dict | None) -> tuple[str, list]:
+    """Compile supported Chroma filters into PostgreSQL JSONB predicates.
+
+    This is the production security boundary: ACL predicates are applied by
+    PostgreSQL before distance ordering and LIMIT, never as Python post-filters.
+    """
+    if not where:
+        return "TRUE", []
+    if "$and" in where:
+        compiled = [_where_sql(item) for item in where["$and"]]
+        return "(" + " AND ".join(sql for sql, _ in compiled) + ")", [
+            value for _, params in compiled for value in params
+        ]
+    if "$or" in where:
+        compiled = [_where_sql(item) for item in where["$or"]]
+        if not compiled:
+            return "FALSE", []
+        return "(" + " OR ".join(sql for sql, _ in compiled) + ")", [
+            value for _, params in compiled for value in params
+        ]
+
+    clauses: list[str] = []
+    params: list = []
+    for key, expected in where.items():
+        if isinstance(expected, dict):
+            for operator, value in expected.items():
+                if operator in {"$eq", "$ne"}:
+                    predicate = "metadata @> ?::jsonb"
+                    clauses.append(predicate if operator == "$eq" else f"NOT ({predicate})")
+                    params.append(json.dumps({key: value}))
+                elif operator in {"$in", "$nin"}:
+                    values = list(value or [])
+                    if not values:
+                        clauses.append("FALSE" if operator == "$in" else "TRUE")
+                        continue
+                    predicates = " OR ".join("metadata @> ?::jsonb" for _ in values)
+                    clauses.append(
+                        f"({predicates})" if operator == "$in" else f"NOT ({predicates})"
+                    )
+                    params.extend(json.dumps({key: item}) for item in values)
+                elif operator in {"$lte", "$lt", "$gte", "$gt"}:
+                    symbol = {"$lte": "<=", "$lt": "<", "$gte": ">=", "$gt": ">"}[operator]
+                    clauses.append(f"NULLIF(metadata ->> ?, '')::double precision {symbol} ?")
+                    params.extend((key, value))
+                else:
+                    raise ValueError(f"Unsupported metadata operator: {operator}")
+        else:
+            clauses.append("metadata @> ?::jsonb")
+            params.append(json.dumps({key: expected}))
+    return "(" + " AND ".join(clauses or ["TRUE"]) + ")", params
+
+
 def _vector_literal(values: Iterable[float]) -> str:
     return "[" + ",".join(f"{float(value):.10g}" for value in values) + "]"
 
@@ -106,6 +158,10 @@ class PostgresVectorStore:
             database.execute(
                 "CREATE INDEX IF NOT EXISTS idx_vector_documents_collection "
                 "ON vector_documents(collection_name)"
+            )
+            database.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vector_documents_metadata_gin "
+                "ON vector_documents USING GIN(metadata jsonb_path_ops)"
             )
 
     def add_texts(self, texts, metadatas=None, ids=None, **kwargs):
@@ -147,43 +203,36 @@ class PostgresVectorStore:
 
     def similarity_search_with_score(self, query, k=4, filter=None, **kwargs):
         query_vector = _vector_literal(self.embedding_function.embed_query(query))
+        where_sql, where_params = _where_sql(filter)
         with connect() as database:
             rows = database.execute(
-                """
+                f"""
                 SELECT document, metadata, embedding <=> ?::vector AS distance
                 FROM vector_documents
-                WHERE collection_name=?
+                WHERE collection_name=? AND {where_sql}
                 ORDER BY embedding <=> ?::vector
+                LIMIT ?
                 """,
-                (query_vector, self.collection_name, query_vector),
+                (query_vector, self.collection_name, *where_params, query_vector, int(k)),
             ).fetchall()
-        results = []
-        for row in rows:
-            metadata = _metadata(row["metadata"])
-            if metadata_matches(metadata, filter):
-                results.append(
-                    (Document(page_content=row["document"], metadata=metadata), float(row["distance"]))
-                )
-                if len(results) >= int(k):
-                    break
-        return results
+        return [
+            (Document(page_content=row["document"], metadata=_metadata(row["metadata"])), float(row["distance"]))
+            for row in rows
+        ]
 
     def get(self, where=None, **kwargs):
+        where_sql, where_params = _where_sql(where)
         with connect() as database:
             rows = database.execute(
-                """
+                f"""
                 SELECT vector_id, document, metadata
                 FROM vector_documents
-                WHERE collection_name=?
+                WHERE collection_name=? AND {where_sql}
                 ORDER BY created_at, vector_id
                 """,
-                (self.collection_name,),
+                (self.collection_name, *where_params),
             ).fetchall()
-        selected = []
-        for row in rows:
-            metadata = _metadata(row["metadata"])
-            if metadata_matches(metadata, where):
-                selected.append((row, metadata))
+        selected = [(row, _metadata(row["metadata"])) for row in rows]
         return {
             "ids": [row["vector_id"] for row, _ in selected],
             "documents": [row["document"] for row, _ in selected],

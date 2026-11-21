@@ -14,6 +14,7 @@ function App({ user }) {
   const [pendingDeleteName, setPendingDeleteName] = useState(null);
   const [docActionMessage, setDocActionMessage] = useState('');
   const [isRefreshingDocs, setIsRefreshingDocs] = useState(false);
+  const [leaderboardRefreshKey, setLeaderboardRefreshKey] = useState(0);
   const [ingestState, setIngestState] = useState(INITIAL_INGEST_STATE);
   const dismissTimerRef = useRef(null);
 
@@ -55,7 +56,10 @@ function App({ user }) {
     }
   }, []);
 
-  const handleManualRefresh = useCallback(() => fetchDocs({ announce: true }), [fetchDocs]);
+  const handleManualRefresh = useCallback(async () => {
+    await fetchDocs({ announce: true });
+    setLeaderboardRefreshKey((value) => value + 1);
+  }, [fetchDocs]);
 
   const handleAccessChange = async (sourceName, accessRole) => {
     try {
@@ -135,6 +139,7 @@ function App({ user }) {
 
   const handleIngestComplete = async () => {
     await fetchDocs();
+    setLeaderboardRefreshKey((value) => value + 1);
     setDocActionMessage('');
     scheduleDismiss(1800);
   };
@@ -169,6 +174,7 @@ function App({ user }) {
         isIngestActive={isIngestActive}
         deletingDocName={deletingDocName}
         isRefreshingDocs={isRefreshingDocs}
+        leaderboardRefreshKey={leaderboardRefreshKey}
         onDelete={handleDeleteDocument}
         onAccessChange={handleAccessChange}
         onRefresh={handleManualRefresh}

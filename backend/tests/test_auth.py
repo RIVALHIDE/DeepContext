@@ -90,6 +90,66 @@ class AuthenticationTests(unittest.TestCase):
         self.assertEqual(viewer.post('/auth/invitations', json={'email': 'x@example.com', 'role': 'admin'}).status_code, 403)
         self.assertEqual(viewer.post('/auth/accept-invite', json={'token': token, 'email': 'viewer@example.com', 'name': 'Viewer', 'password': 'viewer-password-123'}).status_code, 400)
 
+    def test_invitation_preview_prefills_target_and_regeneration_revokes_old_link(self):
+        self.register(self.owner)
+        first = self.owner.post('/auth/invitations', json={
+            'email': '  Teammate@Example.COM ',
+            'role': 'editor',
+        })
+        self.assertEqual(first.status_code, 201, first.text)
+        first_token = first.json()['invite_token']
+        preview = self.owner.get('/auth/invitation-preview', params={'token': first_token})
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()['email'], 'teammate@example.com')
+        self.assertEqual(preview.json()['workspace_name'], 'Alpha')
+        self.assertEqual(preview.json()['role'], 'editor')
+        self.assertFalse(preview.json()['account_exists'])
+
+        second = self.owner.post('/auth/invitations', json={
+            'email': 'teammate@example.com',
+            'role': 'viewer',
+        })
+        self.assertEqual(second.status_code, 201, second.text)
+        self.assertEqual(
+            self.owner.get('/auth/invitation-preview', params={'token': first_token}).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.owner.get('/auth/invitation-preview', params={'token': second.json()['invite_token']}).json()['role'],
+            'viewer',
+        )
+
+    def test_existing_account_can_accept_without_reentering_a_name(self):
+        self.register(self.owner)
+        existing = TestClient(self.app)
+        self.addCleanup(existing.close)
+        self.register(existing, 'existing@example.com', 'Other')
+        token = self.owner.post('/auth/invitations', json={
+            'email': 'existing@example.com',
+            'role': 'member',
+        }).json()['invite_token']
+        preview = existing.get('/auth/invitation-preview', params={'token': token})
+        self.assertTrue(preview.json()['account_exists'])
+        response = existing.post('/auth/accept-invite', json={
+            'token': token,
+            'email': 'existing@example.com',
+            'name': '',
+            'password': 'a-secure-password',
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(existing.get('/auth/me').json()['user']['role'], 'member')
+
+    def test_invitation_rejects_invalid_and_existing_member_emails(self):
+        self.register(self.owner)
+        self.assertEqual(
+            self.owner.post('/auth/invitations', json={'email': 'not-an-email'}).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.owner.post('/auth/invitations', json={'email': 'owner@example.com'}).status_code,
+            409,
+        )
+
     def test_editor_role_can_upload_but_cannot_manage_members(self):
         self.register(self.owner)
         editor, _ = self.invite('editor', 'editor@example.com')
@@ -126,7 +186,7 @@ class AuthenticationTests(unittest.TestCase):
         self.assertEqual(self.owner.post('/auth/switch-workspace', json={'workspace_id': workspace}).status_code, 403)
         scope = self.owner.get('/protected').json()['scope']
         self.assertNotEqual(scope['$and'][0]['team_id'], workspace)
-        self.assertEqual(scope['$and'][1], {'access_level': {'$lte': 3}})
+        self.assertIn('$or', scope['$and'][1])
 
     def test_logout_revokes_copied_token(self):
         self.register(self.owner)

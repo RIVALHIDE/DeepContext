@@ -1,10 +1,12 @@
-import { Award, Crown, Medal, Trophy } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Award, Crown, Medal, Trophy, LoaderCircle } from 'lucide-react';
+import api from '../utils/api.util';
 
 const TIERS = [
   {
     key: 'gold',
     label: 'Gold',
-    threshold: 10,
+    threshold: 25,
     icon: Crown,
     color: '#FCD34D',
     bg: 'rgba(252, 211, 77, 0.12)',
@@ -13,7 +15,7 @@ const TIERS = [
   {
     key: 'silver',
     label: 'Silver',
-    threshold: 5,
+    threshold: 10,
     icon: Medal,
     color: '#64748B',
     bg: 'rgba(100, 116, 139, 0.09)',
@@ -37,16 +39,32 @@ function getTier(contributions) {
   return null;
 }
 
-// Placeholder leaderboard data — wired to a real endpoint when available
-const DEFAULT_LEADERBOARD = [
-  { user_id: 'anon_1', display_name: 'Alex Chen', contributions: 14, team: 'Platform' },
-  { user_id: 'anon_2', display_name: 'Sam Rivera', contributions: 8, team: 'Platform' },
-  { user_id: 'anon_3', display_name: 'Jordan Lee', contributions: 5, team: 'Platform' },
-  { user_id: 'anon_4', display_name: 'Riley Park', contributions: 3, team: 'Platform' },
-  { user_id: 'anon_5', display_name: 'Casey Kim', contributions: 1, team: 'Platform' },
-];
+export default function KnowledgeLeaderboard({ workspaceId, refreshKey }) {
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
 
-export default function KnowledgeLeaderboard({ users = DEFAULT_LEADERBOARD }) {
+  useEffect(() => {
+    if (!workspaceId) return;
+    const controller = new AbortController();
+    api.get(`/api/workspaces/${encodeURIComponent(workspaceId)}/leaderboard`, {
+      signal: controller.signal,
+      params: { refresh: Date.now() },
+      headers: { 'Cache-Control': 'no-cache' },
+    }).then((response) => {
+      setError('');
+      setUsers(response.data?.leaders ?? []);
+    }).catch((failure) => {
+      if (failure?.code !== 'ERR_CANCELED') {
+        setUsers([]);
+        setError(failure?.response?.data?.detail || 'Could not load contributors.');
+      }
+    }).finally(() => {
+      if (!controller.signal.aborted) setLoading(false);
+    });
+    return () => controller.abort();
+  }, [workspaceId, refreshKey]);
+
   const sorted = [...users].sort((a, b) => b.contributions - a.contributions);
 
   return (
@@ -61,7 +79,17 @@ export default function KnowledgeLeaderboard({ users = DEFAULT_LEADERBOARD }) {
         </h3>
       </div>
 
-      {sorted.map((user, idx) => {
+      {loading ? (
+        <div className="flex items-center gap-2 px-2 py-3 text-[11px]" style={{ color: 'var(--dc-text-muted)' }}>
+          <LoaderCircle size={13} className="animate-spin" /> Loading contributors…
+        </div>
+      ) : error ? (
+        <p className="px-2 py-3 text-[11px] leading-4" style={{ color: 'var(--dc-red)' }}>{error}</p>
+      ) : sorted.length === 0 ? (
+        <p className="rounded-lg border border-dashed px-3 py-4 text-center text-[11px] leading-4" style={{ color: 'var(--dc-text-muted)', borderColor: 'var(--dc-border)' }}>
+          No contributors yet in this workspace
+        </p>
+      ) : sorted.map((user, idx) => {
         const tier = getTier(user.contributions);
         if (!tier) return null;
 

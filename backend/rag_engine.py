@@ -12,6 +12,7 @@ from chromadb.telemetry.product import ProductTelemetryClient, ProductTelemetryE
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from access_policy import retrieval_filter
+from acl_security import record_retrieval_audit
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.prompts import MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
@@ -456,6 +457,9 @@ class DeepContextEngine:
                 "preview": preview,
                 "chunk_count": len(group_docs),
                 "chunk_indices": chunk_indices,
+                "_uploader_id": first_meta.get("uploader_id"),
+                "_uploader_name": first_meta.get("uploader_name"),
+                "_uploader_team": first_meta.get("uploader_team"),
             })
 
         return sources
@@ -503,7 +507,7 @@ class DeepContextEngine:
                 continue
             # ✅ Skip old garbage AI responses so they don't poison the context
             if role == "ai" and _is_garbage(content):
-                print(f"⚠️ Skipping garbage history entry: {content[:60]}")
+                print("⚠️ Skipping one invalid history entry")
                 continue
             if role == "human":
                 result.append(HumanMessage(content=content))
@@ -543,10 +547,7 @@ class DeepContextEngine:
             (doc, score) for doc, score in semantic_results if score < distance_max
         ]
 
-        all_dept_data = (
-            self.vector_db.get(where=chroma_filter) if chroma_filter
-            else self.vector_db.get()
-        )
+        all_dept_data = self.vector_db.get(where=chroma_filter)
         all_texts = all_dept_data.get("documents", [])
         all_metadatas = all_dept_data.get("metadatas", [])
 
@@ -639,10 +640,7 @@ class DeepContextEngine:
             return [], set()
 
         chroma_filter = retrieval_filter(team_id, source_names)
-        all_dept_data = (
-            self.vector_db.get(where=chroma_filter) if chroma_filter
-            else self.vector_db.get()
-        )
+        all_dept_data = self.vector_db.get(where=chroma_filter)
         all_texts = all_dept_data.get("documents", [])
         all_metadatas = all_dept_data.get("metadatas", [])
 
@@ -708,7 +706,7 @@ class DeepContextEngine:
                 # NOTE: intentionally NOT added to primary_source_names —
                 # this is a "for context" addition, not a real citation.
 
-                print(f"🧭 Forced diversity added source={source} score={score} (context-only, not a citation)")
+                print("🧭 Forced diversity added one context-only source")
 
                 if len(selected_sources) >= MIN_UNIQUE_SOURCES:
                     break
@@ -768,7 +766,14 @@ class DeepContextEngine:
         return final[:k], primary_source_names
     
     def _retrieve_documents(self, query: str, top_k: int | None = None, team_id: str = None, source_names: List[str] | None = None):
-        return self._hybrid_search(query, k=top_k or self._retrieval_settings()["top_k"], team_id=team_id, source_names=source_names)
+        documents, primary_sources = self._hybrid_search(
+            query,
+            k=top_k or self._retrieval_settings()["top_k"],
+            team_id=team_id,
+            source_names=source_names,
+        )
+        record_retrieval_audit(team_id, query, documents)
+        return documents, primary_sources
 
     def _hybrid_search(self, query: str, k: int = 5, team_id: str = None, source_names: List[str] | None = None):
         settings = self._retrieval_settings()
@@ -782,8 +787,7 @@ class DeepContextEngine:
             if rerank_meta.get("enabled"):
                 print(
                     f"🎯 Rerank | candidates={rerank_meta['candidate_count']} | "
-                    f"latency_ms={rerank_meta['latency_ms']:.0f} | "
-                    f"top={rerank_meta.get('top_preview')}"
+                    f"latency_ms={rerank_meta['latency_ms']:.0f}"
                 )
             else:
                 reason = rerank_meta.get("reason", "unknown")
@@ -822,15 +826,25 @@ class DeepContextEngine:
         self.vector_db = self._create_vector_db()
         return self.vector_db
 
-    def _fetch_diagram_docs_for_sources(self, vector_db, source_names: set[str], team_id: str = None) -> List[Document]:
-        if not source_names:
-            return []
+    def _fetch_diagram_docs_for_sources(
+        self,
+        vector_db,
+        source_names: set[str] | list[str] | None,
+        team_id: str = None,
+    ) -> List[Document]:
+        """Return only caller-visible diagram chunks.
 
-        chroma_filter = retrieval_filter(team_id)
-        snapshot = (
-            vector_db.get(where=chroma_filter) if chroma_filter
-            else vector_db.get()
-        )
+        An empty source list intentionally means "all permitted sources in this
+        workspace". The workspace and ACL constraints are still applied inside
+        the vector-store query, before any diagram metadata is inspected.
+        """
+        normalized_sources = {
+            str(source).strip().casefold()
+            for source in (source_names or [])
+            if str(source).strip()
+        }
+        chroma_filter = retrieval_filter(team_id, normalized_sources or None)
+        snapshot = vector_db.get(where=chroma_filter)
         documents = snapshot.get("documents", [])
         metadatas = snapshot.get("metadatas", [])
 
@@ -838,7 +852,7 @@ class DeepContextEngine:
         for text, meta in zip(documents, metadatas):
             if not isinstance(meta, dict):
                 continue
-            if meta.get("source_name") not in source_names:
+            if normalized_sources and str(meta.get("source_name", "")).casefold() not in normalized_sources:
                 continue
             if meta.get("content_type") not in {"plantuml", "mermaid"}:
                 continue
@@ -919,8 +933,8 @@ class DeepContextEngine:
 
             return candidate
 
-        except Exception as e:
-            print(f"⚠️ Contextualize step failed ({e}), falling back to original question.")
+        except Exception:
+            print("⚠️ Contextualize step failed; falling back to original question.")
             return user_question
 
     def _build_answer_request(self, user_question: str, chat_history: List = None, team_id: str = None, selected_sources: List[str] | None = None) -> dict:
@@ -938,32 +952,17 @@ class DeepContextEngine:
         # Step 1: Reload Chroma to pick up freshly ingested docs
         vector_db = self.get_vector_db(refresh=True)
 
-        visible_snapshot = vector_db.get(where=retrieval_filter(team_id, selected_sources))
-        visible_count = len(visible_snapshot.get("documents", []))
-        visible_sources = sorted({
-            metadata.get("source_name")
-            for metadata in visible_snapshot.get("metadatas", [])
-            if isinstance(metadata, dict) and metadata.get("source_name")
-        })
-        print(
-            f"🔎 Retrieval snapshot | docs_visible={visible_count} | "
-            f"sources_visible={visible_sources[:10]} | question={user_question[:120]!r}"
-        )
-
         safe_history = self._normalize_chat_history(chat_history)
         standalone_q = self._get_standalone_question(user_question, safe_history)
         retrieval_query = standalone_q.strip() or user_question
-        print(
-            f"✅ Retrieval query | standalone_q={retrieval_query[:120]!r} | "
-            f"used_history={bool(safe_history)}"
-        )
+        print(f"✅ Retrieval query prepared | used_history={bool(safe_history)}")
 
         valid_docs, primary_sources = self._retrieve_documents(retrieval_query, team_id=team_id, source_names=selected_sources)
         if (
             not valid_docs
             and retrieval_query.strip().casefold() != user_question.strip().casefold()
         ):
-            print(f"⚠️ No hits for standalone query; falling back to raw question retrieval. standalone_q={retrieval_query}")
+            print("⚠️ No hits for contextual query; retrying the original question")
             valid_docs, primary_sources = self._retrieve_documents(user_question, team_id=team_id, source_names=selected_sources)
 
         if not valid_docs:
@@ -985,17 +984,6 @@ class DeepContextEngine:
 
         diagrams = []
         diagram_docs = []
-
-        top_retrieval_preview = [
-            {
-                "source": (doc.metadata or {}).get("source_name", "Unknown source"),
-                "page": (doc.metadata or {}).get("page"),
-                "status": (doc.metadata or {}).get("status"),
-                "preview": self._doc_preview(doc),
-            }
-            for doc in valid_docs[:5]
-        ]
-        print("🔎 Top retrieved docs |", top_retrieval_preview)
 
         raw_diagram_request_type = detect_diagram_request_type(user_question)
         standalone_diagram_request_type = detect_diagram_request_type(standalone_q)
@@ -1083,12 +1071,7 @@ class DeepContextEngine:
 
         context_block = self._render_context_docs(valid_docs)
         
-        try:
-            print("VALID_DOCS_BEFORE_SOURCES", {"count": len(valid_docs), "sources": [
-                {"source": d.metadata.get("source_name"), "chunk": d.metadata.get("chunk_index")} for d in valid_docs
-            ]})
-        except Exception as exc:
-            print("⚠️ Failed to print VALID_DOCS_BEFORE_SOURCES:", exc)
+        print(f"🔎 Grounded context assembled | chunks={len(valid_docs)}")
 
         return {
             "mode": "answer",
@@ -1195,10 +1178,31 @@ class DeepContextEngine:
         retrieval_query = standalone_q.strip() or question
         state["standalone_question"] = standalone_q
 
-        valid_docs, primary_sources = self._retrieve_documents(retrieval_query, team_id=team_id, source_names=selected_sources)
+        # Diagram commands are metadata lookups, not ordinary semantic Q&A.
+        # Read diagram chunks directly under the mandatory workspace + ACL
+        # filter so a short command such as `/extract_diagram` is reliable.
+        if state.get("intent") == "diagram":
+            valid_docs = self._fetch_diagram_docs_for_sources(
+                vector_db,
+                selected_sources or None,
+                team_id=team_id,
+            )
+            primary_sources = {
+                (getattr(doc, "metadata", {}) or {}).get("source_name")
+                for doc in valid_docs
+                if (getattr(doc, "metadata", {}) or {}).get("source_name")
+            }
+            record_retrieval_audit(team_id, retrieval_query, valid_docs)
+        else:
+            valid_docs, primary_sources = self._retrieve_documents(
+                retrieval_query,
+                team_id=team_id,
+                source_names=selected_sources,
+            )
 
         if (
             not valid_docs
+            and state.get("intent") != "diagram"
             and retrieval_query.strip().casefold() != question.strip().casefold()
         ):
             valid_docs, primary_sources = self._retrieve_documents(question, team_id=team_id, source_names=selected_sources)

@@ -48,6 +48,10 @@ services:
         value: "true"
       - key: RERANK_ENABLED
         value: "false"
+      - key: ACL_ENFORCEMENT_MODE
+        value: enforce
+      - key: ACL_AUTO_BACKFILL
+        value: "true"
       - key: NEXCONN_API_BASE_URL
         sync: false
       - key: NEXCONN_APP_KEY

@@ -44,6 +44,7 @@ export default function DocCard({ doc, onDelete, isDeleting, onAccessChange, use
         </span>
       </div>
       {onAccessChange && <select aria-label={`Access for ${doc.displayName || doc.name}`} value={doc.accessRole || 'viewer'} onChange={(event) => onAccessChange(doc.name, event.target.value)} className="w-full text-[10px] mt-2 rounded p-1" style={{ background: 'var(--dc-bg)', color: 'var(--dc-text-secondary)' }}>
+        {doc.accessRole === 'custom' && <option value="custom" disabled>Custom ACL</option>}
         <option value="viewer">Everyone in workspace</option>
         <option value="member">Members and above</option>
         {['editor', 'admin', 'owner'].includes(userRole) && <option value="editor">Editors and above</option>}

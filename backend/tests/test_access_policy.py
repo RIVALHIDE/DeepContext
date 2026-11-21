@@ -2,18 +2,35 @@ import ast
 from pathlib import Path
 import unittest
 
+from acl_security import acl_metadata
 from access_policy import ROLES, query_clearance, retrieval_filter
+from postgres_vector_store import metadata_matches
 
 
 class AccessPolicyTests(unittest.TestCase):
-    def test_every_role_has_workspace_and_document_restrictions(self):
-        for role, rank in ROLES.items():
+    def test_every_role_has_workspace_and_acl_restrictions(self):
+        for role in ROLES:
             with self.subTest(role=role):
-                self.assertEqual(retrieval_filter(f'workspace-alpha|{rank}'), {
-                    '$and': [{'team_id': 'workspace-alpha'}, {'access_level': {'$lte': rank}}]})
+                scope = self.scope(role)
+                where = retrieval_filter(scope)
+                allowed = {'team_id': 'workspace-alpha', **acl_metadata([f'role:{role}'])}
+                denied = {'team_id': 'workspace-alpha', **acl_metadata(['group:hr-payroll'])}
+                self.assertTrue(metadata_matches(allowed, where))
+                self.assertFalse(metadata_matches(denied, where))
+                self.assertFalse(metadata_matches({**allowed, 'team_id': 'workspace-beta'}, where))
+
+    @staticmethod
+    def scope(role='viewer'):
+        return {
+            'workspace_id': 'workspace-alpha',
+            'user_id': 'user-1',
+            'role': role,
+            'legacy_level': ROLES[role],
+            'effective_acl': ['public', 'user:user-1', f'role:{role}'],
+        }
 
     def test_missing_or_invalid_scope_fails_closed(self):
-        for value in (None, '', 'default', 'alpha', '|0', 'alpha|-1', 'alpha|99', 'alpha|owner', 'alpha|0|3'):
+        for value in (None, '', 'default', 'alpha', {}, {'workspace_id': 'alpha'}, {'effective_acl': ['public']}):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 retrieval_filter(value)
 
@@ -33,8 +50,17 @@ class AccessPolicyTests(unittest.TestCase):
                 return {'documents': [], 'metadatas': []}
 
         vector = VectorDB()
-        namespace[method.name](None, vector, {'example.md'}, 'workspace-alpha|0')
-        self.assertEqual(vector.arguments['where'], retrieval_filter('workspace-alpha|0'))
+        scope = self.scope()
+        namespace[method.name](None, vector, {'example.md'}, scope)
+        self.assertEqual(
+            vector.arguments['where'],
+            retrieval_filter(scope, {'example.md'}),
+        )
+
+        # No explicit source means all caller-visible diagrams, never an
+        # unfiltered workspace-wide collection read.
+        namespace[method.name](None, vector, None, scope)
+        self.assertEqual(vector.arguments['where'], retrieval_filter(scope))
         with self.assertRaises(ValueError):
             namespace[method.name](None, vector, {'example.md'}, None)
 
@@ -54,8 +80,10 @@ class AccessPolicyTests(unittest.TestCase):
 
     def test_editor_clearance_sits_between_member_and_admin(self):
         self.assertEqual(ROLES['editor'], 1.5)
-        self.assertEqual(retrieval_filter('workspace-alpha|1.5'), {
-            '$and': [{'team_id': 'workspace-alpha'}, {'access_level': {'$lte': 1.5}}]})
+        where = retrieval_filter(self.scope('editor'))
+        self.assertTrue(metadata_matches(
+            {'team_id': 'workspace-alpha', **acl_metadata(['role:editor'])}, where,
+        ))
         self.assertLess(ROLES['member'], ROLES['editor'])
         self.assertLess(ROLES['editor'], ROLES['admin'])
 

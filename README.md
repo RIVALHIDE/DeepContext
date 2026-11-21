@@ -56,16 +56,16 @@ Existing anonymous documents and conversations are retained on disk but are not 
 
 The center panel has two separate modes: **AI assistant** is the document-grounded DeepContext chat, while **Nexconn** is a real Nexconn Chat SDK channel. One server-side Nexconn application supports every DeepContext workspace. The backend derives a stable, separate group channel from the authenticated workspace ID, so switching workspaces switches channels without exposing another workspace. The App Secret is used only by the backend to sign Nexconn's access-token request and is never returned to the browser.
 
-Main authentication endpoints: `POST /auth/register`, `/auth/login`, `/auth/logout`, `/auth/workspaces`, `/auth/switch-workspace`, `/auth/invitations`, `/auth/accept-invite`; `GET /auth/me`, `/auth/members`; `PATCH`/`DELETE /auth/members/{user_id}`. Document access is updated with `PATCH /documents/{sourceName}/access` and `{ "access_role": "viewer|member|editor|admin|owner" }`.
+Main authentication endpoints: `POST /auth/register`, `/auth/login`, `/auth/logout`, `/auth/workspaces`, `/auth/switch-workspace`, `/auth/invitations`, `/auth/accept-invite`; `GET /auth/me`, `/auth/members`; `PATCH`/`DELETE /auth/members/{user_id}`. Workspace admins manage security groups through `/auth/groups`. Document permissions are updated with `PATCH /documents/{sourceName}/access` using either the legacy minimum-role field or normalized `acl_entries` such as `public`, `user:<id>`, `group:<id>`, and `role:<role>`. The existing `editor` system role also resolves the exact `role:curator` ACL token.
 
 ### AI clearance enforcement
 
 AI access is enforced at two independent layers:
 
-1. Every Chroma query includes the authenticated workspace ID and `access_level <= current role`. This applies to semantic retrieval, BM25, sibling expansion, diagrams, and document snapshots, so restricted chunks never enter the model context.
+1. Every vector query includes the server-resolved workspace and effective ACL set (`public`, current `user:`, current `role:`, and current `group:` tokens). PostgreSQL/pgvector or Chroma applies this predicate before top-K selection. It covers semantic retrieval, BM25, sibling expansion, diagrams, and document snapshots, so restricted chunks never enter the model context. Roles are exact ACL grants; even an admin cannot read a `user:<ceo-id>`-only document unless explicitly granted.
 2. `access_policy.query_clearance` evaluates sensitive intent before retrieval. Compensation and private employee records require `admin`; credentials and secrets require `owner`. Blocked questions return a clean policy response without calling Chroma or the LLM.
 
-`viewer` is the lowest-clearance role in the five-role model and is the intern-equivalent tier. Keep document access at the lowest role that genuinely needs it; the query guardrail is defense in depth and never replaces document metadata permissions. Add or revise sensitive-topic patterns centrally in `backend/access_policy.py`.
+Missing or empty ACLs fail closed to `role:admin`; `public` is never inferred. Group membership is resolved from the database for every request, so revocation applies immediately. `viewer` is the intern-equivalent tier. The query guardrail is defense in depth and never replaces query-time ACL trimming. Retrieval audits store hashes, ACL-scope summaries, and document IDs—not raw questions or chunk text.
 
 Run backend checks without external services:
 
@@ -245,9 +245,12 @@ LibreOffice is included in the backend Docker image. Modern `.docx`, `.xlsx`, an
 | `GET`    | `/job-progress/{job_id}`       | SSE stream of ingestion job progress      |
 | `GET`    | `/job-status/{job_id}`         | Check ingestion job status                |
 | `GET`    | `/health`                      | API + Chroma health summary               |
-| `GET`    | `/health/chroma`               | Chroma heartbeat and collection stats     |
+| `GET`    | `/health/chroma`               | Privacy-safe vector-store health status   |
 | `GET`    | `/retriveAllDocuments`         | List indexed documents                    |
 | `DELETE` | `/deleteDocument/{sourceName}` | Remove an indexed document by source name |
+| `GET/POST` | `/auth/groups` | List or create workspace security groups |
+| `PUT/DELETE` | `/auth/groups/{group_id}/members[/{user_id}]` | Grant or revoke group membership |
+| `PATCH` | `/documents/{sourceName}/access` | Metadata-only ACL update (no re-embedding) |
 | `POST`   | `/get-answer`                  | Ask a question against shared knowledge   |
 | `POST`   | `/get-answer/stream`           | Ask a question and receive streamed tokens (SSE) |
 | `POST`   | `/get-history/{sessionId}`     | Fetch message history for a session       |
@@ -303,6 +306,10 @@ RERANK_CANDIDATE_K=20
 RERANK_TOP_K=5
 RERANK_MAX_CHUNK_CHARS=1500
 
+# Zero-trust document ACL security
+ACL_ENFORCEMENT_MODE=enforce
+ACL_AUTO_BACKFILL=true
+
 # Celery/Redis
 REDIS_URL=redis://localhost:6379/0
 
@@ -348,7 +355,7 @@ Do not create a different static `CHROMA_COLLECTION_NAME` for each workspace in 
 Health endpoints after startup:
 
 - `GET /health` — API + Chroma summary
-- `GET /health/chroma` — Chroma heartbeat, collection name, document count
+- `GET /health/chroma` — privacy-safe vector-store status (no document counts)
 
 ## Local Development Setup
 
@@ -536,6 +543,24 @@ When a filename includes `meeting` or `transcript`, ingestion follows a dedicate
 - full text is aggregated
 - `MeetingAgent` generates a structured summary
 - summary is stored as a high-value record in Chroma
+
+## Workspace contribution leaderboard
+
+The sidebar leaderboard is computed from auditable events in the active
+workspace; it is not shared across workspaces and no longer uses demo users.
+
+- An uploader receives **10 points** when an editor, admin, or owner approves
+  the document. Immediate approvals for editor-or-higher uploads use the same
+  event.
+- The original uploader receives **2 points per cited chunk** after a grounded
+  AI answer is saved.
+- Badges are **Bronze** at 1–9 points, **Silver** at 10–24, and **Gold** at 25+.
+- Approval and citation event keys are idempotent, so retries cannot apply the
+  same contribution twice.
+
+The authenticated endpoint is
+`GET /api/workspaces/{workspace_id}/leaderboard`. It only permits the user's
+currently active workspace and returns the top ten contributors.
 
 ## Diagram Behavior
 

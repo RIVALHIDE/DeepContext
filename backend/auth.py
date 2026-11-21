@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import re
 import secrets
 import time
 import tempfile
@@ -18,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from database import DB_PATH, IntegrityError, connect as database_connect, is_postgres
 from access_policy import ROLES, retrieval_filter
+from acl_security import effective_acl_scope
 
 router = APIRouter(prefix='/auth', tags=['Authentication and workspaces'])
 principal_context = ContextVar('principal', default=None)
@@ -140,8 +142,7 @@ def session_owner():
 
 
 def retrieval_scope():
-    user = current()
-    return f"{user['workspace_id']}|{ROLES[user['role']]}"
+    return effective_acl_scope(current())
 
 
 def authenticate(request):
@@ -202,7 +203,11 @@ def install_auth(app):
             same_host = parsed.hostname == request.url.hostname and parsed.port in (5173, request.url.port)
             if not same_host and origin not in allowed:
                 return JSONResponse({'detail': 'Untrusted request origin'}, status_code=403)
-        public = {'/auth/register', '/auth/login', '/auth/accept-invite', '/health', '/health/chroma', '/docs', '/openapi.json', '/redoc'}
+        public = {
+            '/auth/register', '/auth/login', '/auth/accept-invite',
+            '/auth/invitation-preview', '/health', '/health/chroma',
+            '/docs', '/openapi.json', '/redoc',
+        }
         if request.url.path in public:
             return await call_next(request)
         try:
@@ -228,7 +233,13 @@ class Registration(Credentials):
 
 def normalize_email(email):
     email = email.strip().lower()
-    if '@' not in email or any(character.isspace() for character in email):
+    # Intentionally accept personal domains for small teams, while rejecting
+    # malformed addresses that would create invitations nobody can redeem.
+    if (
+        len(email) > 254
+        or any(character.isspace() for character in email)
+        or not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", email)
+    ):
         raise HTTPException(422, 'Enter a valid email address')
     return email
 
@@ -341,8 +352,92 @@ def members():
         return {'members': [dict(row) for row in rows]}
 
 
+class GroupCreate(BaseModel):
+    id: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=100)
+
+
+class GroupMemberChange(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
+
+
+def normalize_group_id(value: str) -> str:
+    group_id = str(value or '').strip().lower()
+    if not group_id or not all(character.isalnum() or character in '._-@+' for character in group_id):
+        raise HTTPException(422, 'Group ID may contain letters, numbers, dot, underscore, dash, @ or +')
+    return group_id
+
+
+@router.get('/groups')
+def list_groups():
+    actor = require_role('admin')
+    with connect() as db:
+        groups = [dict(row) for row in db.execute(
+            '''SELECT g.id, g.name, COUNT(gm.user_id) AS member_count
+               FROM workspace_groups g
+               LEFT JOIN group_memberships gm
+                 ON gm.workspace_id=g.workspace_id AND gm.group_id=g.id
+               WHERE g.workspace_id=? GROUP BY g.id, g.name ORDER BY g.name''',
+            (actor['workspace_id'],),
+        )]
+    return {'groups': groups}
+
+
+@router.post('/groups', status_code=201)
+def create_group(payload: GroupCreate):
+    actor = require_role('admin')
+    group_id = normalize_group_id(payload.id)
+    try:
+        with connect() as db:
+            db.execute(
+                'INSERT INTO workspace_groups (id, workspace_id, name) VALUES (?, ?, ?)',
+                (group_id, actor['workspace_id'], payload.name.strip()),
+            )
+    except IntegrityError:
+        raise HTTPException(409, 'A group with this ID or name already exists')
+    return {'id': group_id, 'name': payload.name.strip()}
+
+
+@router.put('/groups/{group_id}/members')
+def add_group_member(group_id: str, payload: GroupMemberChange):
+    actor = require_role('admin')
+    group_id = normalize_group_id(group_id)
+    with connect() as db:
+        group = db.execute(
+            'SELECT 1 FROM workspace_groups WHERE workspace_id=? AND id=?',
+            (actor['workspace_id'], group_id),
+        ).fetchone()
+        member = db.execute(
+            'SELECT 1 FROM memberships WHERE workspace_id=? AND user_id=?',
+            (actor['workspace_id'], payload.user_id),
+        ).fetchone()
+        if not group or not member:
+            raise HTTPException(404, 'Group or workspace member not found')
+        db.execute(
+            '''INSERT OR IGNORE INTO group_memberships
+               (workspace_id, group_id, user_id) VALUES (?, ?, ?)''',
+            (actor['workspace_id'], group_id, payload.user_id),
+        )
+    return {'message': 'Group membership added'}
+
+
+@router.delete('/groups/{group_id}/members/{user_id}')
+def remove_group_member(group_id: str, user_id: str):
+    actor = require_role('admin')
+    group_id = normalize_group_id(group_id)
+    with connect() as db:
+        result = db.execute(
+            '''DELETE FROM group_memberships
+               WHERE workspace_id=? AND group_id=? AND user_id=?''',
+            (actor['workspace_id'], group_id, user_id),
+        )
+    if not result.rowcount:
+        raise HTTPException(404, 'Group membership not found')
+    return {'message': 'Group membership revoked'}
+
+
 class Invitation(BaseModel):
-    email: str
+    email: str = Field(min_length=3, max_length=254)
     role: str = 'viewer'
 
 
@@ -357,22 +452,79 @@ def validate_assignment(role, actor):
 def invite(payload: Invitation):
     user = require_role('admin')
     validate_assignment(payload.role, user)
+    email = normalize_email(payload.email)
+    if email == user['email']:
+        raise HTTPException(409, 'You already belong to this workspace')
     token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    expires = int(time.time()) + 7 * 86400
     with connect() as db:
+        existing_member = db.execute(
+            '''SELECT 1 FROM memberships m JOIN auth_users u ON u.id=m.user_id
+               WHERE m.workspace_id=? AND u.email=?''',
+            (user['workspace_id'], email),
+        ).fetchone()
+        if existing_member:
+            raise HTTPException(409, 'This person already belongs to the workspace')
+        # Only the newest pending invitation for this email/workspace remains
+        # usable. This makes the "generate a new link" action predictable.
+        db.execute(
+            'DELETE FROM invitations WHERE workspace_id=? AND email=? AND used=0',
+            (user['workspace_id'], email),
+        )
         db.execute('INSERT INTO invitations VALUES (?, ?, ?, ?, ?, 0)',
-                   (hashlib.sha256(token.encode()).hexdigest(), user['workspace_id'], normalize_email(payload.email), payload.role, int(time.time()) + 7 * 86400))
-    return {'invite_token': token, 'expires_in_days': 7}
+                   (token_hash, user['workspace_id'], email, payload.role, expires))
+    return {
+        'invite_token': token,
+        'email': email,
+        'role': payload.role,
+        'workspace_name': user['workspace_name'],
+        'expires_at': expires,
+        'expires_in_days': 7,
+    }
+
+
+@router.get('/invitation-preview')
+def invitation_preview(token: str):
+    """Resolve a capability link without requiring an existing session."""
+    token = str(token or '').strip()
+    if len(token) < 20:
+        raise HTTPException(400, 'Invitation link is invalid')
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    now = int(time.time())
+    with connect() as db:
+        invitation = db.execute(
+            '''SELECT i.email, i.role, i.expires, w.name AS workspace_name,
+                      CASE WHEN u.id IS NULL THEN 0 ELSE 1 END AS account_exists
+               FROM invitations i
+               JOIN workspaces w ON w.id=i.workspace_id
+               LEFT JOIN auth_users u ON u.email=i.email
+               WHERE i.token_hash=? AND i.used=0 AND i.expires>?''',
+            (digest, now),
+        ).fetchone()
+    if not invitation:
+        raise HTTPException(400, 'Invitation is invalid, expired or already used')
+    return {
+        'email': invitation['email'],
+        'role': invitation['role'],
+        'workspace_name': invitation['workspace_name'],
+        'expires_at': invitation['expires'],
+        'account_exists': bool(invitation['account_exists']),
+    }
 
 
 class AcceptInvitation(Credentials):
     token: str
-    name: str = Field(min_length=1, max_length=100)
+    name: str = Field(default='', max_length=100)
 
 
 @router.post('/accept-invite')
 def accept_invite(payload: AcceptInvitation, response: Response):
     email = normalize_email(payload.email)
-    digest = hashlib.sha256(payload.token.encode()).hexdigest()
+    token = str(payload.token or '').strip()
+    if len(token) < 20:
+        raise HTTPException(400, 'Invitation link is invalid')
+    digest = hashlib.sha256(token.encode()).hexdigest()
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         invitation = db.execute('SELECT * FROM invitations WHERE token_hash=? AND email=? AND used=0 AND expires>?', (digest, email, int(time.time()))).fetchone()
@@ -381,9 +533,15 @@ def accept_invite(payload: AcceptInvitation, response: Response):
         user = db.execute('SELECT * FROM auth_users WHERE email=?', (email,)).fetchone()
         if user:
             if not verify_password(payload.password, user['password_hash']):
-                raise HTTPException(401, 'Enter your existing account password')
+                raise HTTPException(
+                    401,
+                    'Incorrect existing account password. This email is already registered; '
+                    'a new teammate must be invited using their own email address.',
+                )
             user_id = user['id']
         else:
+            if not payload.name.strip():
+                raise HTTPException(422, 'Your name is required')
             user_id = uuid.uuid4().hex
             db.execute('INSERT INTO auth_users VALUES (?, ?, ?, ?)', (user_id, email, payload.name.strip(), password_hash(payload.password)))
         existing = db.execute('SELECT 1 FROM memberships WHERE user_id=? AND workspace_id=?', (user_id, invitation['workspace_id'])).fetchone()
@@ -417,5 +575,7 @@ def remove_member(user_id: str):
         result = db.execute("DELETE FROM memberships WHERE workspace_id=? AND user_id=? AND role!='owner'", (actor['workspace_id'], user_id))
         if not result.rowcount:
             raise HTTPException(400, 'Member not found or owner cannot be removed')
+        db.execute('DELETE FROM group_memberships WHERE workspace_id=? AND user_id=?',
+                   (actor['workspace_id'], user_id))
         db.execute('DELETE FROM auth_sessions WHERE workspace_id=? AND user_id=?', (actor['workspace_id'], user_id))
     return {'message': 'Workspace access revoked'}

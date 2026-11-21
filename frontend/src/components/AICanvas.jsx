@@ -78,8 +78,8 @@ export default function AICanvas({ flowData, embedded = false }) {
         >
           <span className="mb-3 flex h-11 w-11 items-center justify-center rounded-2xl" style={{ background: 'var(--dc-brand-dim)', color: 'var(--dc-brand)' }}><Network size={21} /></span>
           <p className="text-sm font-semibold" style={{ color: 'var(--dc-text-primary)' }}>No context map yet</p>
-          <p className="mt-1 text-xs leading-relaxed" style={{ color: 'var(--dc-text-muted)' }}>
-            Ask the AI, then use{' '}
+          <p className="mt-1 max-w-[280px] text-xs leading-relaxed" style={{ color: 'var(--dc-text-muted)' }}>
+            Upload a file containing Mermaid or PlantUML, then type{' '}
             <code
               className="mx-1 px-1.5 py-0.5 rounded"
               style={{
@@ -90,7 +90,7 @@ export default function AICanvas({ flowData, embedded = false }) {
             >
               /extract_diagram
             </code>
-            to map the answer.
+            {' '}to open its visual map.
           </p>
         </div>
       ) : (

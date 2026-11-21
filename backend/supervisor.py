@@ -10,6 +10,7 @@ from document_registry import (
     upsert_document,
 )
 from rag_engine import DeepContextEngine
+from acl_security import acl_metadata, normalize_acl_entries
 
 class Supervisor:
     def __init__(self):
@@ -22,11 +23,11 @@ class Supervisor:
         document_id, new_version = prepare_supersede(file_name, workspace_id)
         if deleted_count:
             print(
-                f"♻️ [VERSION] Superseded {file_name} | deleted_chunks={deleted_count} | "
+                f"♻️ [VERSION] Superseded document | deleted_chunks={deleted_count} | "
                 f"next_version={new_version}"
             )
         else:
-            print(f"🆕 [VERSION] First ingest for source  {file_name} | version={new_version}")
+            print(f"🆕 [VERSION] First ingest | version={new_version}")
         return document_id, new_version
 
     def _register_indexed_chunks(
@@ -37,6 +38,7 @@ class Supervisor:
         version: int,
         ingested_at: str,
         workspace_id: str,
+        acl_entries,
     ) -> list[str]:
         chunk_ids = collect_chunk_ids_for_version(
             vector_db,
@@ -53,21 +55,34 @@ class Supervisor:
             chunk_ids=chunk_ids,
             ingested_at=ingested_at,
             status="active",
+            acl_entries=acl_entries,
         )
         return chunk_ids
         
-    def supervisor(self, file_path: str, job_id: str | None = None, team_id: str = "default", access_level: float = 0):
+    def supervisor(
+        self,
+        file_path: str,
+        job_id: str | None = None,
+        team_id: str = "default",
+        access_level: float = 0,
+        uploader_id: str = "",
+        uploader_name: str = "",
+        uploader_team: str = "",
+        acl_entries=None,
+    ):
         file_name = os.path.basename(file_path).lower()
         vector_db = self.engine.get_vector_db(refresh=True)
         ingested_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        acl_tokens = normalize_acl_entries(acl_entries)
+        chunk_acl_metadata = acl_metadata(acl_tokens)
         
         # --- BRANCH 1: MEETING FATIGUE LOGIC ---
         if "meeting" in file_name or "transcript" in file_name:
-            print(f"🎙️ [MODE: MEETING] Analyzing transcript: {file_name}")
+            print("🎙️ [MODE: MEETING] Analyzing transcript")
             
             docs = self.ingest.ingestion_documents(file_path, job_id=job_id)
             if not docs:
-                raise RuntimeError(f"No content extracted from meeting file: {file_name}")
+                raise RuntimeError("No content extracted from meeting file")
             full_text = " ".join([d.page_content for d in docs])
 
             if job_id:
@@ -100,6 +115,10 @@ class Supervisor:
                     "status": "verified",
                     "team_id": team_id,
                     "access_level": access_level,
+                    "uploader_id": uploader_id,
+                    "uploader_name": uploader_name,
+                    "uploader_team": uploader_team,
+                    **chunk_acl_metadata,
                 }]
             )
             
@@ -111,20 +130,20 @@ class Supervisor:
                 version,
                 ingested_at,
                 team_id,
+                acl_tokens,
             )
             print(
-                f"📦 [WRITE] Meeting summary stored | version={version} | chunks={len(chunk_ids)} | "
-                f"source={file_name}"
+                f"📦 [WRITE] Meeting summary stored | version={version} | chunks={len(chunk_ids)}"
             )
             print(f"✅ [SUCCESS] Meeting summary saved to ChromaDB.")
             return "Meeting Processed"
 
         # --- BRANCH 2: STANDARD AUDIT LOGIC (Your existing code) ---
         else:
-            print(f"🚀 [MODE: AUDIT] Starting High-Speed Audit: {file_name}")
+            print("🚀 [MODE: AUDIT] Starting High-Speed Audit")
             new_chunks = self.ingest.ingestion_documents(file_path, job_id=job_id)
             if not new_chunks:
-                raise RuntimeError(f"No content extracted from file: {file_name}")
+                raise RuntimeError("No content extracted from file")
 
             document_id, version = self._supersede_existing_document(vector_db, file_name, team_id)
 
@@ -142,6 +161,10 @@ class Supervisor:
                         "status": "verified",
                         "team_id": team_id,
                         "access_level": access_level,
+                        "uploader_id": uploader_id,
+                        "uploader_name": uploader_name,
+                        "uploader_team": uploader_team,
+                        **chunk_acl_metadata,
                     })
                     processed_chunks.append(chunk)
 
@@ -163,9 +186,9 @@ class Supervisor:
                 version,
                 ingested_at,
                 team_id,
+                acl_tokens,
             )
             print(
-                f"📦 [WRITE] Audit chunks stored | version={version} | chunks_written={len(chunk_ids)} | "
-                f"source={file_name}"
+                f"📦 [WRITE] Audit chunks stored | version={version} | chunks_written={len(chunk_ids)}"
             )
             return processed_chunks

@@ -7,20 +7,26 @@ def _connect():
     return connect(None if is_postgres() else DB_PATH)
 
 class ChatHistroyManager:
-    def save_messages(self, sessionId: str, role: str, content: str, diagrams=None, sources=None):
+    def save_messages(
+        self, sessionId: str, role: str, content: str, diagrams=None,
+        sources=None, retrieval_grounded=None,
+    ):
         initDB()
         conn = _connect()
         cursor = conn.cursor()
         self._ensure_extra_columns(cursor)
 
         cursor.execute(
-            "INSERT INTO chat_history (session_id, role, content, diagrams, sources) VALUES (?, ?, ?, ?, ?)",
+            """INSERT INTO chat_history
+               (session_id, role, content, diagrams, sources, retrieval_grounded)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             (
                 sessionId,
                 role,
                 content,
                 json.dumps(diagrams) if diagrams else None,
                 json.dumps(sources) if sources else None,
+                None if retrieval_grounded is None else int(bool(retrieval_grounded)),
             )
         )
         conn.commit()
@@ -37,7 +43,9 @@ class ChatHistroyManager:
         self._ensure_extra_columns(cursor)
 
         cursor.execute(
-            "SELECT id, role, content, diagrams, sources FROM chat_history WHERE session_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
+            """SELECT id, role, content, diagrams, sources, retrieval_grounded
+               FROM chat_history WHERE session_id = ?
+               ORDER BY timestamp DESC, id DESC LIMIT ?""",
             (sessionId, limit,)
         )
 
@@ -45,7 +53,10 @@ class ChatHistroyManager:
         conn.close()
 
         history = []
-        for history_id, role, content, diagrams_raw, sources_raw in reversed(result):
+        for row in reversed(result):
+            history_id, role, content, diagrams_raw, sources_raw, retrieval_grounded = (
+                row[0], row[1], row[2], row[3], row[4], row[5]
+            )
             parsed_diagrams = []
             if diagrams_raw:
                 try:
@@ -68,6 +79,7 @@ class ChatHistroyManager:
             }
             if role == "ai":
                 entry["sources"] = parsed_sources
+                entry["retrieval_grounded"] = retrieval_grounded
 
             history.append(entry)
 

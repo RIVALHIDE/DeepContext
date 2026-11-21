@@ -2,11 +2,23 @@ import json
 import os
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import redis
 import redis.asyncio as aioredis
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+def _redis_url() -> str:
+    value = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
+    if value.startswith("rediss://"):
+        parsed = urlsplit(value)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query.setdefault("ssl_cert_reqs", "required")
+        value = urlunsplit(parsed._replace(query=urlencode(query)))
+    return value
+
+
+REDIS_URL = _redis_url()
 LATEST_TTL_SECONDS = 3600
 TERMINAL_STAGES = frozenset({"completed", "failed"})
 

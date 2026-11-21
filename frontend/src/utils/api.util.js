@@ -7,6 +7,9 @@ const apiBaseUrl =
 const api = axios.create({
     baseURL: apiBaseUrl,
     withCredentials: true,
+    // Render free instances may need roughly 50 seconds to wake. Keep enough
+    // headroom for a cold start, but never leave buttons spinning forever.
+    timeout: 75000,
 })
 
 api.interceptors.response.use((response) => response, (error) => {

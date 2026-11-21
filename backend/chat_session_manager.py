@@ -50,7 +50,10 @@ class ChatSessionManager:
         )
         rows = cursor.fetchall()
 
-        for index, (session_id, created_at, last_message_at, preview) in enumerate(rows, start=1):
+        for index, row in enumerate(rows, start=1):
+            session_id, created_at, last_message_at, preview = (
+                row[0], row[1], row[2], row[3]
+            )
             cursor.execute(
                 """
                 INSERT OR IGNORE INTO chat_sessions

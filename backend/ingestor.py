@@ -87,11 +87,26 @@ class DataIngestor:
             blocks.append((code, prefix))
         return blocks
 
-    def _extract_mermaid_blocks(self, text: str) -> list[str]:
-        return [
-            match.group(1).strip()
-            for match in re.finditer(r"```mermaid\s*([\s\S]*?)```", text, re.IGNORECASE)
-        ]
+    def _extract_mermaid_blocks(self, text: str) -> list[tuple[str, str]]:
+        blocks = []
+        for match in re.finditer(r"```mermaid\s*([\s\S]*?)```", text, re.IGNORECASE):
+            code = match.group(1).strip()
+            prefix = text[max(0, match.start() - 500):match.start()]
+            blocks.append((code, prefix))
+        return blocks
+
+    def _extract_mermaid_title(
+        self,
+        prefix: str,
+        file_name: str,
+        index: int,
+        total: int,
+    ) -> str:
+        """Use the closest Markdown heading as a stable, searchable map title."""
+        headings = re.findall(r"^#{1,6}\s+(.+?)\s*$", prefix or "", re.MULTILINE)
+        if headings:
+            return headings[-1].strip()
+        return f"{file_name} Mermaid {index}" if total > 1 else file_name
 
     def _looks_like_raw_mermaid(self, text: str) -> bool:
         stripped = str(text or "").strip()
@@ -138,7 +153,7 @@ class DataIngestor:
             mermaid_blocks = self._extract_mermaid_blocks(raw_text)
 
             if ext in {".mmd", ".mermaid"} and self._looks_like_raw_mermaid(raw_text):
-                mermaid_blocks = mermaid_blocks or [raw_text.strip()]
+                mermaid_blocks = mermaid_blocks or [(raw_text.strip(), "")]
 
             for idx, (code, prefix) in enumerate(plantuml_blocks, start=1):
                 title = self._extract_puml_title(code, prefix)
@@ -163,8 +178,13 @@ class DataIngestor:
                     })
                 ))
 
-            for idx, code in enumerate(mermaid_blocks, start=1):
-                title = f"{file_name} Mermaid {idx}" if len(mermaid_blocks) > 1 else file_name
+            for idx, (code, prefix) in enumerate(mermaid_blocks, start=1):
+                title = self._extract_mermaid_title(
+                    prefix,
+                    file_name,
+                    idx,
+                    len(mermaid_blocks),
+                )
                 diagram_docs.append(Document(
                     page_content=(
                         f"Diagram title: {title}\n"

@@ -27,13 +27,24 @@ def _client():
     if not is_remote_storage():
         raise RuntimeError("S3_BUCKET is not configured")
     import boto3
+    from botocore.config import Config
+
+    endpoint = os.getenv("S3_ENDPOINT_URL", "").strip()
+    access_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    if not endpoint or not access_key or not secret_key:
+        raise RuntimeError(
+            "Object storage is incomplete: set S3_ENDPOINT_URL, "
+            "S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY"
+        )
 
     return boto3.client(
         "s3",
-        endpoint_url=os.getenv("S3_ENDPOINT_URL") or None,
+        endpoint_url=endpoint,
         region_name=os.getenv("S3_REGION", "auto"),
-        aws_access_key_id=os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY"),
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(s3={"addressing_style": "path"}),
     )
 
 

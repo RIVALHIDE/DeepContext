@@ -13,6 +13,23 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Local test suites, demo files, and generated test artifacts
+backend/tests/
+frontend/tests/
+tests/
+**/__tests__/
+test_*.py
+*_test.py
+frontend/src/**/*.test.*
+frontend/src/**/*.spec.*
+**/*.test.*
+**/*.spec.*
+demo_data/
+coverage/
+.pytest_cache/
+.coverage
+htmlcov/
+
 # ── Data & Cache (runtime generated) ────────────────────────────────────────
 backend/data/
 backend/chroma_db/

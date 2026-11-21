@@ -5,6 +5,12 @@ from collections import defaultdict
 from datetime import datetime
 
 from database import DB_PATH, connect, initDB, is_postgres
+from acl_security import (
+    acl_metadata,
+    minimum_role_acl,
+    normalize_acl_entries,
+    strip_acl_metadata,
+)
 
 
 def _ensure_db():
@@ -29,6 +35,10 @@ def _row_to_dict(row) -> dict | None:
         data["chunk_ids"] = json.loads(chunk_ids_raw)
     except json.JSONDecodeError:
         data["chunk_ids"] = []
+    try:
+        data["acl_entries"] = normalize_acl_entries(data.get("acl_entries"), default=False)
+    except ValueError:
+        data["acl_entries"] = []
     return data
 
 
@@ -88,10 +98,12 @@ def upsert_document(
     chunk_ids: list[str],
     ingested_at: str,
     status: str = "active",
+    acl_entries=None,
 ) -> dict:
     normalized = normalize_source_name(source_name)
     workspace_id = _workspace(workspace_id)
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    acl_tokens = normalize_acl_entries(acl_entries)
     conn = _connect()
     try:
         conn.execute(
@@ -103,15 +115,17 @@ def upsert_document(
                 current_version,
                 chunk_ids,
                 ingested_at,
+                acl_entries,
                 status,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(workspace_id, source_name) DO UPDATE SET
                 document_id = excluded.document_id,
                 current_version = excluded.current_version,
                 chunk_ids = excluded.chunk_ids,
                 ingested_at = excluded.ingested_at,
+                acl_entries = excluded.acl_entries,
                 status = excluded.status,
                 updated_at = excluded.updated_at
             """,
@@ -122,11 +136,23 @@ def upsert_document(
                 current_version,
                 json.dumps(chunk_ids),
                 ingested_at,
+                json.dumps(acl_tokens),
                 status,
                 now,
                 now,
             ),
         )
+        conn.execute(
+            "DELETE FROM document_acl_entries WHERE workspace_id=? AND document_id=?",
+            (workspace_id, document_id),
+        )
+        for token in acl_tokens:
+            conn.execute(
+                """INSERT INTO document_acl_entries
+                   (workspace_id, document_id, acl_token, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (workspace_id, document_id, token, now),
+            )
         conn.commit()
         return get_document(normalized, workspace_id)
     finally:
@@ -138,9 +164,22 @@ def delete_document_record(source_name: str, workspace_id: str) -> bool:
     workspace_id = _workspace(workspace_id)
     conn = _connect()
     try:
+        existing = conn.execute(
+            "SELECT document_id FROM documents WHERE source_name=? AND workspace_id=?",
+            (normalized, workspace_id),
+        ).fetchone()
         cursor = conn.execute(
             "DELETE FROM documents WHERE source_name = ? AND workspace_id = ?",
             (normalized, workspace_id),
+        )
+        if existing:
+            conn.execute(
+                "DELETE FROM document_acl_entries WHERE workspace_id=? AND document_id=?",
+                (workspace_id, existing["document_id"]),
+            )
+        conn.execute(
+            "DELETE FROM document_access WHERE workspace_id=? AND source_name=?",
+            (workspace_id, normalized),
         )
         conn.commit()
         return cursor.rowcount > 0
@@ -259,6 +298,21 @@ def migrate_legacy_duplicate_chunks(vector_db) -> dict:
         existing = get_document(normalized, workspace_id)
         document_id = existing["document_id"] if existing else str(uuid.uuid4())
         current_version = int(existing["current_version"]) if existing else max(len(sorted_ingested), 1)
+        if existing:
+            acl_entries = normalize_acl_entries(existing.get("acl_entries"))
+        else:
+            with _connect() as registry_db:
+                legacy_access = registry_db.execute(
+                    """SELECT access_level FROM document_access
+                       WHERE workspace_id=? AND source_name=?""",
+                    (workspace_id, normalized),
+                ).fetchone()
+            legacy_roles = {0.0: "viewer", 1.0: "member", 1.5: "editor", 2.0: "admin", 3.0: "owner"}
+            try:
+                legacy_role = legacy_roles.get(float(legacy_access["access_level"]))
+            except (TypeError, ValueError):
+                legacy_role = None
+            acl_entries = minimum_role_acl(legacy_role) if legacy_role else normalize_acl_entries(None)
 
         upsert_document(
             document_id=document_id,
@@ -268,6 +322,21 @@ def migrate_legacy_duplicate_chunks(vector_db) -> dict:
             chunk_ids=keep_ids,
             ingested_at=latest_ingested_at,
             status="active",
+            acl_entries=acl_entries,
+        )
+        # Old vector records can predate document_id and ACL metadata. Repair
+        # metadata only; the embedding and text remain untouched.
+        metadata_by_id = {
+            vector_id: metadata for vector_id, metadata in zip(ids, metadatas)
+            if isinstance(metadata, dict)
+        }
+        vector_db._collection.update(
+            ids=keep_ids,
+            metadatas=[{
+                **strip_acl_metadata(metadata_by_id.get(vector_id, {})),
+                "document_id": document_id,
+                **acl_metadata(acl_entries),
+            } for vector_id in keep_ids],
         )
         documents_processed += 1
 
@@ -288,21 +357,23 @@ def create_pending_upload(
     mime_type: str,
     uploaded_by: str = "anonymous",
     team_id: str = "default",
+    acl_entries=None,
 ) -> dict:
     """Insert a new pending upload record awaiting approval."""
     _ensure_db()
     conn = _connect()
     try:
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        acl_tokens = normalize_acl_entries(acl_entries)
         conn.execute(
             """
             INSERT INTO pending_uploads
                 (document_id, source_name, file_path, file_size, mime_type,
-                 status, uploaded_by, team_id, uploaded_at)
-            VALUES (?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?)
+                 status, uploaded_by, team_id, uploaded_at, acl_entries)
+            VALUES (?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?, ?)
             """,
             (document_id, source_name, file_path, file_size, mime_type,
-             uploaded_by, team_id, now),
+             uploaded_by, team_id, now, json.dumps(acl_tokens)),
         )
         conn.commit()
         return get_pending_upload(document_id)

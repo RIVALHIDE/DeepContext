@@ -35,6 +35,7 @@ export default function WorkspaceLayout({
   isIngestActive,
   deletingDocName,
   isRefreshingDocs,
+  leaderboardRefreshKey,
   onDelete,
   onAccessChange,
   onRefresh,
@@ -54,6 +55,7 @@ export default function WorkspaceLayout({
   const [showMapHistory, setShowMapHistory] = useState(false);
   const [activeMapId, setActiveMapId] = useState(null);
   const [chatMode, setChatMode] = useState('ai');
+  const [leaderboardRevision, setLeaderboardRevision] = useState(0);
   const showIngestSidebar = ['uploading', 'processing', 'pending_approval', 'failed'].includes(ingestState?.status);
   const workspaceSources = useMemo(
     () => sourcesForDocuments(lastSources, docs),
@@ -96,6 +98,9 @@ export default function WorkspaceLayout({
     }
     // Update CitationMetrics with latest sources
     setLastSources(data.sources || []);
+    if (Array.isArray(data.sources) && data.sources.length > 0) {
+      setLeaderboardRevision((value) => value + 1);
+    }
   }, []);
 
   return (
@@ -179,7 +184,10 @@ export default function WorkspaceLayout({
             className="mt-6 pt-4 border-t"
             style={{ borderTop: '1px solid var(--dc-border)' }}
           >
-            <KnowledgeLeaderboard />
+            <KnowledgeLeaderboard
+              workspaceId={user.workspace_id}
+              refreshKey={`${leaderboardRefreshKey}:${leaderboardRevision}`}
+            />
           </div>
         </div>
 
@@ -327,7 +335,7 @@ export default function WorkspaceLayout({
                 })}
               </div>
               <div className="min-h-0 flex-1">
-                {activeTab === 'pullrequests' && <DocumentPullRequest user={user} onComplete={onRefresh} onCountChange={setPendingCount} />}
+                {activeTab === 'pullrequests' && <DocumentPullRequest user={user} onComplete={onRefresh} onCountChange={setPendingCount} onLeaderboardChange={() => setLeaderboardRevision((value) => value + 1)} />}
                 {activeTab === 'metrics' && <CitationMetrics sources={workspaceSources} documents={docs} />}
               </div>
             </div>

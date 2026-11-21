@@ -2,6 +2,8 @@
 
 import re
 
+from acl_security import acl_filter
+
 ROLES = {'viewer': 0, 'member': 1, 'editor': 1.5, 'admin': 2, 'owner': 3}
 
 
@@ -39,24 +41,8 @@ QUERY_CLEARANCE_RULES = (
 
 
 def retrieval_filter(scope, source_names=None):
-    """Restrict retrieval by workspace, clearance, and optional explicit files."""
-    workspace, separator, level = str(scope or '').partition('|')
-    try:
-        parsed_level = float(level)
-    except (TypeError, ValueError):
-        parsed_level = None
-    if not workspace or not separator or parsed_level not in ROLES.values():
-        raise ValueError('An authenticated workspace retrieval scope is required')
-    normalized_level = int(parsed_level) if parsed_level.is_integer() else parsed_level
-    filters = [{'team_id': workspace}, {'access_level': {'$lte': normalized_level}}]
-    selected = list(dict.fromkeys(
-        str(source_name).strip().casefold()
-        for source_name in (source_names or [])
-        if str(source_name).strip()
-    ))
-    if selected:
-        filters.append({'source_name': {'$in': selected}})
-    return {'$and': filters}
+    """Apply mandatory workspace + ACL security trimming inside vector queries."""
+    return acl_filter(scope, source_names)
 
 
 def query_clearance(question, role):

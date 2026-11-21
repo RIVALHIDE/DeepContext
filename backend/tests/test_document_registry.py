@@ -15,6 +15,8 @@ class FakeVectorDB:
         self.rows = list(rows)
         self.deleted = []
         self.where_calls = []
+        self.updated = []
+        self._collection = self
 
     def get(self, where=None):
         self.where_calls.append(where)
@@ -35,6 +37,14 @@ class FakeVectorDB:
     def delete(self, ids):
         self.deleted.extend(ids)
         self.rows = [row for row in self.rows if row[0] not in set(ids)]
+
+    def update(self, ids, metadatas):
+        self.updated.extend(zip(ids, metadatas))
+        updates = dict(zip(ids, metadatas))
+        self.rows = [
+            (row_id, text, updates.get(row_id, metadata))
+            for row_id, text, metadata in self.rows
+        ]
 
 
 class DocumentRegistryWorkspaceTests(unittest.TestCase):
@@ -100,6 +110,28 @@ class DocumentRegistryWorkspaceTests(unittest.TestCase):
                 ("policy.md",),
             ).fetchall()
         self.assertEqual([(row["workspace_id"], row["access_level"]) for row in rows], [("alpha", 0.0), ("beta", 2.0)])
+
+    def test_legacy_migration_preserves_access_and_repairs_chunk_acl_metadata(self):
+        with auth.connect() as connection:
+            connection.execute(
+                "INSERT INTO document_access VALUES (?, ?, ?)",
+                ("payroll.pdf", "alpha", 2),
+            )
+        vectors = FakeVectorDB([
+            ("old-chunk", "Restricted payroll", {
+                "source_name": "payroll.pdf", "team_id": "alpha",
+                "ingested_at": "2026-01-01 00:00:00",
+            }),
+        ])
+
+        result = document_registry.migrate_legacy_duplicate_chunks(vectors)
+
+        self.assertEqual(result["documents_processed"], 1)
+        record = document_registry.get_document("payroll.pdf", "alpha")
+        self.assertEqual(record["acl_entries"], ["role:admin", "role:owner"])
+        repaired = vectors.updated[0][1]
+        self.assertEqual(repaired["document_id"], record["document_id"])
+        self.assertEqual(repaired["acl_entries"], '["role:admin","role:owner"]')
 
 
 if __name__ == "__main__":

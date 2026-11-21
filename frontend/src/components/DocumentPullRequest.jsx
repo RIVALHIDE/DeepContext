@@ -7,7 +7,7 @@ import { waitForIngestProgress } from '../utils/ingestProgress.util';
  * DocumentPullRequest — lists pending uploads awaiting approval.
  * Admins can Approve (triggers ChromaDB ingestion) or Reject.
  */
-export default function DocumentPullRequest({ user, onComplete, onCountChange }) {
+export default function DocumentPullRequest({ user, onComplete, onCountChange, onLeaderboardChange }) {
   const canApprove = ['editor', 'admin', 'owner'].includes(user?.role);
   const [pendingDocs, setPendingDocs] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -49,6 +49,7 @@ export default function DocumentPullRequest({ user, onComplete, onCountChange })
         type: 'success',
         message: res.data?.message || 'Document approved. Ingestion started.',
       });
+      onLeaderboardChange?.();
       await fetchPending(false);
       if (res.data?.job_id) {
         const progress = await waitForIngestProgress(res.data.job_id, {
