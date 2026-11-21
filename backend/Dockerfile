@@ -16,6 +16,11 @@ RUN python -m pip install --upgrade pip setuptools wheel
 
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Bake the small embedding model into the image. Render Free erases runtime
+# cache files when it sleeps, so downloading this on every cold start would be
+# slow and would create unnecessary outbound traffic.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+
 
 COPY . .
 

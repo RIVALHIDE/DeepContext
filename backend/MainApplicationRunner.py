@@ -13,7 +13,6 @@ from celery.result import AsyncResult
 from chat_history_manager import ChatHistroyManager
 from chat_session_manager import ChatSessionManager
 from database import initDB
-import supervisor
 from fastapi import FastAPI,File,UploadFile,HTTPException,Form
 from fastapi.middleware.cors import CORSMiddleware
 from auth import (install_auth, current, require_role, session_owner, retrieval_scope, retrieval_filter,
@@ -98,7 +97,6 @@ app.add_middleware(
 app.include_router(nexconn_router)
 
 engine = DeepContextEngine()
-supervisor = supervisor.Supervisor()
 history_manager = ChatHistroyManager()
 session_manager = ChatSessionManager()
 

@@ -15,6 +15,7 @@ DEFAULT_STARTUP_RETRY_DELAY = 2.0
 
 def get_chroma_settings() -> dict[str, Any]:
     return {
+        "backend": os.getenv("VECTOR_STORE_BACKEND", "chroma").strip().lower(),
         "host": os.getenv("CHROMA_HOST", DEFAULT_HOST),
         "port": int(os.getenv("CHROMA_PORT", str(DEFAULT_PORT))),
         "ssl": os.getenv("CHROMA_SSL", "false").lower() == "true",
@@ -26,6 +27,8 @@ def get_chroma_settings() -> dict[str, Any]:
 
 def chroma_endpoint(settings: dict[str, Any] | None = None) -> str:
     cfg = settings or get_chroma_settings()
+    if cfg.get("backend") == "postgres":
+        return "postgresql+pgvector"
     scheme = "https" if cfg["ssl"] else "http"
     return f"{scheme}://{cfg['host']}:{cfg['port']}"
 
@@ -33,7 +36,7 @@ def chroma_endpoint(settings: dict[str, Any] | None = None) -> str:
 def log_chroma_config(log_fn: Callable[[str], None] = print) -> dict[str, Any]:
     cfg = get_chroma_settings()
     log_fn(
-        "Chroma config | "
+        "Vector store config | "
         f"endpoint={chroma_endpoint(cfg)} | "
         f"collection={cfg['collection_name']} | "
         f"retries={cfg['max_retries']} | "
@@ -72,6 +75,21 @@ def wait_for_chroma(
     log_fn: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     cfg = settings or get_chroma_settings()
+    if cfg.get("backend") == "postgres":
+        from database import connect
+
+        with connect() as database:
+            database.execute("SELECT 1").fetchone()
+        log_fn(
+            f"Vector store ready | endpoint={chroma_endpoint(cfg)} | "
+            f"collection={cfg['collection_name']}"
+        )
+        return {
+            "status": "healthy",
+            "endpoint": chroma_endpoint(cfg),
+            "collection_name": cfg["collection_name"],
+            "heartbeat": "database-ok",
+        }
     last_error: Exception | None = None
 
     for attempt in range(1, cfg["max_retries"] + 1):
@@ -108,6 +126,29 @@ def wait_for_chroma(
 
 def check_chroma_health(settings: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg = settings or get_chroma_settings()
+    if cfg.get("backend") == "postgres":
+        try:
+            from database import connect
+
+            with connect() as database:
+                row = database.execute(
+                    "SELECT COUNT(*) AS total FROM vector_documents WHERE collection_name=?",
+                    (cfg["collection_name"],),
+                ).fetchone()
+            return {
+                "status": "healthy",
+                "endpoint": chroma_endpoint(cfg),
+                "collection_name": cfg["collection_name"],
+                "document_count": int(row["total"]),
+                "heartbeat": "database-ok",
+            }
+        except Exception as exc:
+            return {
+                "status": "unhealthy",
+                "endpoint": chroma_endpoint(cfg),
+                "collection_name": cfg["collection_name"],
+                "error": str(exc),
+            }
     try:
         client = build_chroma_client(cfg["host"], cfg["port"], cfg["ssl"])
         heartbeat = client.heartbeat()

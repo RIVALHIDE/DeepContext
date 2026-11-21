@@ -19,7 +19,10 @@ app = Celery(
 
 app.conf.update(
     task_track_started=True,
-    result_expires=3600
+    result_expires=3600,
+    task_always_eager=os.getenv("CELERY_TASK_ALWAYS_EAGER", "false").lower() == "true",
+    task_store_eager_result=True,
+    task_eager_propagates=False,
 )
 
 

@@ -1,7 +1,7 @@
 """Shared upload storage for API/worker deployments.
 
-Set S3_BUCKET plus S3_ENDPOINT_URL/S3 credentials for Cloudflare R2 or any
-S3-compatible provider.  Without them, files stay local for development.
+Set S3_BUCKET plus S3_ENDPOINT_URL/S3 credentials for Neon Object Storage or
+any S3-compatible provider. Without them, files stay local for development.
 """
 from __future__ import annotations
 

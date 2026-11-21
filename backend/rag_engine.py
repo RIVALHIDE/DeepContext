@@ -5,6 +5,7 @@ from rank_bm25 import BM25Okapi
 from typing import List, TypedDict, Optional, Annotated
 import json
 import operator
+from functools import lru_cache
 from langchain_chroma import Chroma
 from chromadb.config import System
 from chromadb.telemetry.product import ProductTelemetryClient, ProductTelemetryEvent
@@ -28,6 +29,7 @@ from chroma_health import (
     wait_for_chroma,
 )
 from reranker import ChunkReranker
+from postgres_vector_store import PostgresVectorStore
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(CURRENT_DIR, ".env"))
@@ -318,17 +320,23 @@ class RAGState(TypedDict):
 MAX_REFLECTION_RETRIES = 2
 
 
+@lru_cache(maxsize=2)
+def _shared_embeddings(local_files_only: bool):
+    """Load one embedding model per process, including eager ingestion."""
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu", "local_files_only": local_files_only},
+        encode_kwargs={"normalize_embeddings": False},
+        cache_folder=os.path.expanduser("~/.cache/huggingface/hub"),
+    )
+
+
 class DeepContextEngine:
     def __init__(self):
         # Allow the model to download into the shared cache on first boot, then
         # optionally switch back to cache-only mode for offline runs.
         self.hf_local_files_only = os.getenv("HUGGINGFACE_LOCAL_FILES_ONLY", "false").lower() == "true"
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu", "local_files_only": self.hf_local_files_only},
-            encode_kwargs={"normalize_embeddings": False},
-            cache_folder=os.path.expanduser("~/.cache/huggingface/hub"),
-        )
+        self.embeddings = _shared_embeddings(self.hf_local_files_only)
 
         self.db_path = os.path.join(CURRENT_DIR, "chroma_db")
         chroma_cfg = get_chroma_settings()
@@ -790,7 +798,12 @@ class DeepContextEngine:
         return self._expand_sibling_chunks(reranked, k=k, team_id=team_id, source_names=source_names)
 
     def _create_vector_db(self):
-        """Create a Chroma handle backed by the shared Chroma HTTP server."""
+        """Create the configured local Chroma or cloud pgvector store."""
+        if os.getenv("VECTOR_STORE_BACKEND", "chroma").strip().lower() == "postgres":
+            return PostgresVectorStore(
+                collection_name=self.collection_name,
+                embedding_function=self.embeddings,
+            )
         wait_for_chroma()
         fresh_client = build_chroma_client(
             host=self.chroma_host,
