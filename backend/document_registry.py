@@ -1,11 +1,10 @@
 import json
 import os
-import sqlite3
 import uuid
 from collections import defaultdict
 from datetime import datetime
 
-from database import DB_PATH, initDB
+from database import DB_PATH, connect, initDB, is_postgres
 
 
 def _ensure_db():
@@ -18,12 +17,10 @@ def normalize_source_name(source_name: str) -> str:
 
 def _connect():
     _ensure_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect(None if is_postgres() else DB_PATH)
 
 
-def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
+def _row_to_dict(row) -> dict | None:
     if row is None:
         return None
     data = dict(row)

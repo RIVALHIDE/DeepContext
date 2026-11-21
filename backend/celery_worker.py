@@ -3,8 +3,8 @@ from celery.signals import worker_ready
 from supervisor import Supervisor
 from ingest_progress import publish
 from chroma_health import log_chroma_config, wait_for_chroma
-from database import initDB, DB_PATH
-import sqlite3
+from database import connect, initDB
+from object_storage import delete as delete_staged_file, local_copy
 import requests
 import os
 
@@ -64,8 +64,7 @@ def process_document_task(self, file_source: str, is_slack_upload: bool = False,
             )
             return "Download Failed"
     else:
-        file_to_process = file_source
-        file_name = os.path.basename(file_to_process)
+        file_name = os.path.basename(file_source)
         publish(
             job_id,
             "uploaded",
@@ -74,21 +73,20 @@ def process_document_task(self, file_source: str, is_slack_upload: bool = False,
         )
 
     try:
-        supervisor = Supervisor()
-        supervisor.supervisor(file_to_process, job_id=job_id, team_id=team_id, access_level=access_level)
-        with sqlite3.connect(DB_PATH) as database:
-            database.execute('''INSERT INTO document_access(source_name, workspace_id, access_level)
-                                VALUES (?, ?, ?)
-                                ON CONFLICT(workspace_id, source_name)
-                                DO UPDATE SET access_level=excluded.access_level''',
-                             (os.path.basename(file_to_process).casefold(), team_id, access_level))
-        publish(job_id, "completed", "Ingestion complete", file_name=os.path.basename(file_to_process))
-        return "Ingestion Complete"
+        context = local_copy(file_to_process) if is_slack_upload else local_copy(file_source)
+        with context as local_file:
+            supervisor = Supervisor()
+            supervisor.supervisor(local_file, job_id=job_id, team_id=team_id, access_level=access_level)
+            with connect() as database:
+                database.execute('''INSERT INTO document_access(source_name, workspace_id, access_level)
+                                    VALUES (?, ?, ?)
+                                    ON CONFLICT(workspace_id, source_name)
+                                    DO UPDATE SET access_level=excluded.access_level''',
+                                 (os.path.basename(local_file).casefold(), team_id, access_level))
+            publish(job_id, "completed", "Ingestion complete", file_name=os.path.basename(local_file))
+            if not is_slack_upload:
+                delete_staged_file(file_source)
+            return "Ingestion Complete"
     except Exception as exc:
-        publish(
-            job_id,
-            "failed",
-            str(exc),
-            file_name=os.path.basename(file_to_process),
-        )
+        publish(job_id, "failed", str(exc), file_name=file_name)
         raise

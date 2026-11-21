@@ -6,19 +6,18 @@ so they do not appear in shell history or the process list.
 
 import argparse
 import getpass
-import sqlite3
 
 from auth import normalize_email, password_hash
-from database import DB_PATH
+from database import connect
 
 
-def reset_local_password(email: str, new_password: str, db_path: str = DB_PATH) -> int:
+def reset_local_password(email: str, new_password: str, db_path: str | None = None) -> int:
     """Replace one local password, revoke its sessions, and return the count."""
     normalized = normalize_email(email)
     if not 12 <= len(new_password) <= 128:
         raise ValueError("Password must contain between 12 and 128 characters.")
 
-    with sqlite3.connect(db_path) as database:
+    with connect(db_path) as database:
         user = database.execute(
             "SELECT id FROM auth_users WHERE email=?", (normalized,),
         ).fetchone()

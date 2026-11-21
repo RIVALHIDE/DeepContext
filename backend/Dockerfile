@@ -23,4 +23,4 @@ EXPOSE 2020
 
 RUN mkdir -p data
 
-CMD ["uvicorn", "MainApplicationRunner:app", "--host", "0.0.0.0", "--port", "2020"]
+CMD ["sh", "-c", "uvicorn MainApplicationRunner:app --host 0.0.0.0 --port ${PORT:-2020}"]

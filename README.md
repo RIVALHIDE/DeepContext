@@ -546,10 +546,164 @@ When a filename includes `meeting` or `transcript`, ingestion follows a dedicate
 ## Current Limitations
 
 - Workspace access uses roles and minimum document roles; custom per-person document allowlists are not implemented
-- SQLite is suitable for local/lightweight usage, not high concurrency production
+- SQLite is the zero-configuration local default; production uses PostgreSQL when `DATABASE_URL` is set
 - PlantUML rendering depends on external PlantUML image hosting
-- Upload validation and operational hardening can be improved
 - Endpoint naming includes legacy typo: `/retriveAllDocuments`
+
+## Production deployment: Render API + Vercel frontend
+
+The repository includes [`render.yaml`](./render.yaml), so Render can create the
+API, Celery worker, PostgreSQL, Redis-compatible Key Value, and persistent
+Chroma service together. Cloudflare R2 provides the shared upload staging area
+used by both the API and worker. Do not use Render's local filesystem for
+uploads: the API and worker have separate filesystems.
+
+### 1. Rotate exposed credentials
+
+Before deploying, regenerate any Groq, Nexconn, or Slack credentials that have
+ever appeared in screenshots, chat, terminal output, or committed files.
+Production secrets belong in provider dashboards, not Git.
+
+### 2. Create Cloudflare R2 storage
+
+1. Open **Cloudflare Dashboard → Storage & databases → R2 Object Storage → Overview**.
+2. Select **Create bucket**, name it (for example `deepcontext-uploads`), and keep it private.
+3. Return to **R2 Overview → Manage API tokens → Create Account API token**.
+4. Grant **Object Read & Write** for only that bucket.
+5. Save the access-key ID and secret immediately; the secret is shown once.
+6. From R2 Overview, copy the S3 endpoint shown for the account. It has the form
+   `https://ACCOUNT_ID.r2.cloudflarestorage.com`.
+
+These map to:
+
+```ini
+S3_ENDPOINT_URL=https://ACCOUNT_ID.r2.cloudflarestorage.com
+S3_BUCKET=deepcontext-uploads
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+S3_REGION=auto
+```
+
+Do not enable public bucket access. DeepContext accesses objects server-side.
+
+### 3. Push this repository to GitHub
+
+Commit the deployment files, then push them to the branch you want Render and
+Vercel to deploy. Confirm that neither `backend/.env` nor `frontend/.env` is in
+the commit; use the committed `.env.example` files only as references.
+
+### 4. Create the Render stack from the Blueprint
+
+1. Open **Render Dashboard → New + → Blueprint**.
+2. Connect the GitHub repository and select its branch.
+3. Render detects the root `render.yaml`. Select **Apply**.
+4. When prompted for secret values, enter:
+   - `GROQ_API_KEY`
+   - `NEXCONN_API_BASE_URL`
+   - `NEXCONN_APP_KEY`
+   - `NEXCONN_APP_SECRET`
+   - the five `S3_*` values from step 2
+   - temporarily set `AUTH_ALLOWED_ORIGINS` to `https://example.invalid`
+5. Wait for `deepcontext-postgres`, `deepcontext-redis`, and
+   `deepcontext-chroma` to become available, followed by
+   `deepcontext-api` and `deepcontext-worker`.
+
+Dashboard locations after creation:
+
+- PostgreSQL URL: **deepcontext-postgres → Connect → Internal Database URL**.
+  The Blueprint injects this automatically as `DATABASE_URL`; do not paste the
+  external URL into the API or worker.
+- Redis URL: **deepcontext-redis → Connect → Internal URL**. It is injected as
+  `REDIS_URL`.
+- Chroma disk: **deepcontext-chroma → Disks**. The disk is mounted at `/data`.
+- API variables: **deepcontext-api → Environment**.
+- Worker logs: **deepcontext-worker → Logs**.
+- API URL: **deepcontext-api → Connect** (for example
+  `https://deepcontext-api.onrender.com`).
+
+The Blueprint intentionally uses paid production plans: 2 GB each for the API
+and model-heavy worker, a persistent Chroma private service, the smallest paid
+PostgreSQL plan, and persistent Key Value. A free Render Postgres database is
+appropriate only for a demo because it expires after 30 days. You can lower
+plans in `render.yaml` for a short-lived test, but 512 MB API/worker instances
+can run out of memory while loading embeddings, OCR, or LibreOffice.
+
+### 5. Deploy the Vite frontend to Vercel
+
+1. Open **Vercel Dashboard → Add New… → Project**.
+2. Import the same GitHub repository.
+3. In **Configure Project**, set **Root Directory** to `frontend`.
+4. Vercel should detect Vite. Confirm:
+   - Build command: `npm run build`
+   - Output directory: `dist`
+5. Open **Project Settings → Environment Variables** and add:
+
+```ini
+VITE_API_BASE_URL=https://YOUR-API.onrender.com
+```
+
+6. Enable Production, Preview, and Development as appropriate, then deploy.
+7. Copy the final Vercel production origin, such as
+   `https://deepcontext.vercel.app` (no trailing slash).
+
+### 6. Finish cross-site authentication
+
+Open **Render → deepcontext-api → Environment** and replace
+`AUTH_ALLOWED_ORIGINS` with the exact Vercel origin. For multiple trusted
+frontends, use a comma-separated list with no wildcard:
+
+```ini
+AUTH_ALLOWED_ORIGINS=https://deepcontext.vercel.app
+AUTH_COOKIE_SECURE=true
+AUTH_COOKIE_SAMESITE=none
+APP_ENV=production
+```
+
+Select **Save, rebuild, and deploy**. The production cookie needs
+`SameSite=None; Secure` because `vercel.app` and `onrender.com` are different
+sites. If you later use custom subdomains on one parent domain, `lax` can be
+used after testing.
+
+### 7. Verify every service
+
+Open these URLs after the deploy finishes:
+
+```text
+https://YOUR-API.onrender.com/health
+https://YOUR-API.onrender.com/health/chroma
+https://YOUR-API.onrender.com/docs
+```
+
+Then create a workspace in the Vercel UI, upload a small text/PDF file, and
+watch **Render → deepcontext-worker → Logs**. A complete test must show the
+upload progressing through extraction and indexing, then return a cited answer
+in the same workspace.
+
+### 8. Optional: copy existing local SQLite data
+
+For a new production installation, skip this step. To preserve existing users,
+workspaces, chat history, and document registry metadata, copy the **External
+Database URL** from **Render → deepcontext-postgres → Connect**, allow your
+current IP if Render requests it, then run locally:
+
+```bash
+cd backend
+source .venv/bin/activate
+export DATABASE_URL='PASTE_RENDER_EXTERNAL_DATABASE_URL'
+python migrate_sqlite_to_postgres.py --sqlite ./data/users.db
+unset DATABASE_URL
+```
+
+This migrates relational metadata only. Existing Chroma vectors and old local
+upload staging files are not uploaded to R2; re-upload original documents if
+the production Chroma collection is new.
+
+### Production environment reference
+
+The API and worker must share exactly the same `DATABASE_URL`, `REDIS_URL`,
+`CHROMA_*`, and `S3_*` values. `JWT_SECRET` is API-only and must remain stable.
+Vercel receives only `VITE_API_BASE_URL`; never put Groq, Nexconn secret, R2
+secret, JWT secret, or database credentials in a `VITE_*` variable.
 
 ## License
 

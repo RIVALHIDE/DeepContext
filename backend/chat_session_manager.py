@@ -1,12 +1,12 @@
-import sqlite3
 from datetime import datetime
 
-from database import DB_PATH
+from database import DB_PATH, connect, initDB, is_postgres
 
 
 class ChatSessionManager:
     def _connect(self):
-        return sqlite3.connect(DB_PATH)
+        initDB()
+        return connect(None if is_postgres() else DB_PATH)
 
     def _legacy_patterns(self, username: str):
         normalized = str(username or "").strip()

@@ -4,7 +4,6 @@ import hmac
 import os
 from pathlib import Path
 import secrets
-import sqlite3
 import time
 import tempfile
 import uuid
@@ -17,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from database import DB_PATH
+from database import DB_PATH, IntegrityError, connect as database_connect, is_postgres
 from access_policy import ROLES, retrieval_filter
 
 router = APIRouter(prefix='/auth', tags=['Authentication and workspaces'])
@@ -28,11 +27,13 @@ SESSION_SECONDS = 8 * 3600
 
 @contextmanager
 def connect():
-    connection = sqlite3.connect(DB_PATH, timeout=15)
-    connection.row_factory = sqlite3.Row
+    connection = database_connect()
     try:
-        with connection:
-            yield connection
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -56,6 +57,11 @@ def init_auth():
           PRIMARY KEY(workspace_id, source_name));
         CREATE TABLE IF NOT EXISTS login_attempts (key TEXT NOT NULL, attempted INTEGER NOT NULL);
         ''')
+        if is_postgres():
+            db.execute('ALTER TABLE pending_uploads ADD COLUMN IF NOT EXISTS access_level INTEGER NOT NULL DEFAULT 0')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_document_access_workspace ON document_access(workspace_id)')
+            return
+
         columns = {row[1] for row in db.execute('PRAGMA table_info(pending_uploads)')}
         if 'access_level' not in columns:
             db.execute('ALTER TABLE pending_uploads ADD COLUMN access_level INTEGER NOT NULL DEFAULT 0')
@@ -168,8 +174,16 @@ def issue_session(response, user_id, workspace_id):
     token = jwt.encode({'sub': user_id, 'wid': workspace_id, 'jti': session_id, 'iat': now,
                         'exp': now + SESSION_SECONDS, 'aud': 'deepcontext', 'iss': 'deepcontext'},
                        signing_key(), algorithm='HS256')
-    response.set_cookie(COOKIE, token, httponly=True, secure=os.getenv('AUTH_COOKIE_SECURE', 'false').lower() == 'true',
-                        samesite='lax', max_age=SESSION_SECONDS, path='/')
+    secure = os.getenv('AUTH_COOKIE_SECURE', 'false').lower() == 'true'
+    same_site = os.getenv('AUTH_COOKIE_SAMESITE', 'lax').strip().lower()
+    if same_site not in {'lax', 'strict', 'none'}:
+        raise RuntimeError('AUTH_COOKIE_SAMESITE must be lax, strict, or none')
+    if same_site == 'none' and not secure:
+        raise RuntimeError('AUTH_COOKIE_SECURE must be true when AUTH_COOKIE_SAMESITE=none')
+    response.set_cookie(
+        COOKIE, token, httponly=True, secure=secure, samesite=same_site,
+        max_age=SESSION_SECONDS, path='/'
+    )
 
 
 def install_auth(app):
@@ -182,7 +196,7 @@ def install_auth(app):
         if request.method == 'OPTIONS':
             return await call_next(request)
         origin = request.headers.get('origin')
-        allowed = set(filter(None, os.getenv('AUTH_ALLOWED_ORIGINS', '').split(',')))
+        allowed = {value.strip() for value in os.getenv('AUTH_ALLOWED_ORIGINS', '').split(',') if value.strip()}
         if origin:
             parsed = urlsplit(origin)
             same_host = parsed.hostname == request.url.hostname and parsed.port in (5173, request.url.port)
@@ -231,7 +245,7 @@ def register(payload: Registration, response: Response):
                        (user_id, email, payload.name.strip(), password_hash(payload.password)))
             db.execute('INSERT INTO workspaces VALUES (?, ?)', (workspace_id, payload.workspace_name.strip()))
             db.execute('INSERT INTO memberships VALUES (?, ?, ?)', (workspace_id, user_id, 'owner'))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise HTTPException(409, 'An account with this email already exists. Please sign in.')
     issue_session(response, user_id, workspace_id)
     return {'message': 'Workspace created'}
@@ -277,7 +291,12 @@ def logout(request: Request, response: Response):
     claims = jwt.decode(token, signing_key(), algorithms=['HS256'], audience='deepcontext', issuer='deepcontext')
     with connect() as db:
         db.execute('DELETE FROM auth_sessions WHERE id=?', (claims['jti'],))
-    response.delete_cookie(COOKIE, path='/')
+    response.delete_cookie(
+        COOKIE,
+        path='/',
+        secure=os.getenv('AUTH_COOKIE_SECURE', 'false').lower() == 'true',
+        samesite=os.getenv('AUTH_COOKIE_SAMESITE', 'lax').strip().lower(),
+    )
     return {'message': 'Signed out'}
 
 

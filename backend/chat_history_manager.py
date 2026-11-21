@@ -1,11 +1,15 @@
 import json
-import sqlite3
 
-from database import DB_PATH
+from database import DB_PATH, connect, initDB, is_postgres
+
+
+def _connect():
+    return connect(None if is_postgres() else DB_PATH)
 
 class ChatHistroyManager:
     def save_messages(self, sessionId: str, role: str, content: str, diagrams=None, sources=None):
-        conn = sqlite3.connect(DB_PATH)
+        initDB()
+        conn = _connect()
         cursor = conn.cursor()
         self._ensure_extra_columns(cursor)
 
@@ -23,15 +27,12 @@ class ChatHistroyManager:
         conn.close()
 
     def _ensure_extra_columns(self, cursor):
-        cursor.execute("PRAGMA table_info(chat_history)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "diagrams" not in columns:
-            cursor.execute("ALTER TABLE chat_history ADD COLUMN diagrams TEXT")
-        if "sources" not in columns:
-            cursor.execute("ALTER TABLE chat_history ADD COLUMN sources TEXT")
+        # Columns are installed centrally by database.initDB for both engines.
+        return None
 
     def get_history(self, sessionId: str, limit=200):
-        conn = sqlite3.connect(DB_PATH)
+        initDB()
+        conn = _connect()
         cursor = conn.cursor()
         self._ensure_extra_columns(cursor)
 
@@ -77,7 +78,7 @@ class ChatHistroyManager:
         if human_turn < 0:
             raise ValueError("human_turn must be non-negative")
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect()
         cursor = conn.cursor()
         row = cursor.execute(
             """
@@ -97,7 +98,7 @@ class ChatHistroyManager:
         conn.close()
     
     def deleteChatBySession(self,sessionId:str):
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect()
         cursor = conn.cursor()
         
         cursor.execute(

@@ -1,7 +1,6 @@
 from datetime import datetime
 import json
 import os
-import shutil
 import requests
 import asyncio
 import uuid
@@ -36,6 +35,7 @@ from document_registry import (
     approve_pending_upload,
     reject_pending_upload,
 )
+from object_storage import delete as delete_staged_file, exists as staged_file_exists, store_upload
 from rag_engine import DeepContextEngine, _normalize_markdown_answer
 from webhook import router as nexconn_router
 
@@ -77,7 +77,7 @@ origin = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://10.121.162.97:5173",
-    *filter(None, os.getenv("AUTH_ALLOWED_ORIGINS", "").split(",")),
+    *(value.strip() for value in os.getenv("AUTH_ALLOWED_ORIGINS", "").split(",") if value.strip()),
 ]
 
 initDB()
@@ -86,7 +86,7 @@ install_auth(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origin,            # Allows requests from your React app
-    allow_origin_regex=r"^https?://[^/]+:5173$",
+    allow_origin_regex=(r"^https?://[^/]+:5173$" if os.getenv("APP_ENV", "development") != "production" else None),
     allow_credentials=True,           # Allows cookies/auth headers
     allow_methods=["*"],              # Allows all methods (GET, POST, etc.)
     allow_headers=["*"],              # Allows all headers
@@ -243,30 +243,30 @@ async def upload_docs(file: UploadFile = File(...), access_role: str = Form(""))
                    f"Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
 
-    # ── Save file to disk ──
-    os.makedirs("./data", exist_ok=True)
+    # ── Save to shared object storage (or local disk in development) ──
     safe_name = os.path.basename((file.filename or '').replace('\\', '/'))
     if not safe_name or safe_name in ('.', '..'):
         raise HTTPException(422, 'A valid filename is required')
     source_name = f"{actor['workspace_id']}__{safe_name}"
-    # Each upload has its own directory; pending uploads cannot overwrite each other.
-    upload_dir = os.path.join('./data', 'uploads', actor['workspace_id'], uuid.uuid4().hex)
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, source_name)
-    with open(file_path, "wb") as buffer:
-        buffer.write(content)
+    document_id = str(uuid.uuid4())
+    file_path = store_upload(
+        content, actor['workspace_id'], document_id, source_name, mime_type or ext
+    )
 
     # ── Register the upload before either approval or immediate ingestion ──
-    document_id = str(uuid.uuid4())
-    create_pending_upload(
-        document_id=document_id,
-        source_name=source_name,
-        file_path=file_path,
-        file_size=file_size,
-        mime_type=mime_type or ext,
-        uploaded_by=actor["id"],
-        team_id=actor["workspace_id"],
-    )
+    try:
+        create_pending_upload(
+            document_id=document_id,
+            source_name=source_name,
+            file_path=file_path,
+            file_size=file_size,
+            mime_type=mime_type or ext,
+            uploaded_by=actor["id"],
+            team_id=actor["workspace_id"],
+        )
+    except Exception:
+        delete_staged_file(file_path)
+        raise
 
     with auth_connect() as db:
         db.execute('UPDATE pending_uploads SET access_level=? WHERE document_id=?', (ROLES[access_role], document_id))
@@ -320,21 +320,24 @@ async def stage_nexconn_shared_file(file: UploadFile = File(...)):
 
     document_id = str(uuid.uuid4())
     source_name = f"{actor['workspace_id']}__{safe_name}"
-    upload_dir = os.path.join('./data', 'uploads', actor['workspace_id'], document_id)
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, source_name)
-    with open(file_path, 'wb') as buffer:
-        buffer.write(content)
-
-    create_pending_upload(
-        document_id=document_id,
-        source_name=source_name,
-        file_path=file_path,
-        file_size=len(content),
-        mime_type=file.content_type or extension,
-        uploaded_by=actor['id'],
-        team_id=actor['workspace_id'],
+    file_path = store_upload(
+        content, actor['workspace_id'], document_id, source_name,
+        file.content_type or extension,
     )
+
+    try:
+        create_pending_upload(
+            document_id=document_id,
+            source_name=source_name,
+            file_path=file_path,
+            file_size=len(content),
+            mime_type=file.content_type or extension,
+            uploaded_by=actor['id'],
+            team_id=actor['workspace_id'],
+        )
+    except Exception:
+        delete_staged_file(file_path)
+        raise
     with auth_connect() as database:
         database.execute(
             'UPDATE pending_uploads SET access_level=? WHERE document_id=?',
@@ -364,11 +367,7 @@ def discard_failed_nexconn_share(document_id: str):
             "UPDATE pending_uploads SET status='rejected' WHERE document_id=?",
             (document_id,),
         )
-    try:
-        os.remove(record['file_path'])
-        os.rmdir(os.path.dirname(record['file_path']))
-    except OSError:
-        pass
+    delete_staged_file(record['file_path'])
     return {'message': 'Unsent shared file removed'}
 
 
@@ -404,8 +403,8 @@ def approve_document(document_id: str):
         raise HTTPException(status_code=400, detail=f"Document is not pending (status={record.get('status')})")
 
     file_path = record.get("file_path")
-    if not file_path or not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found on disk for this document.")
+    if not file_path or not staged_file_exists(file_path):
+        raise HTTPException(status_code=404, detail="The staged upload could not be found in object storage.")
 
     team_id = record.get("team_id", "default")
     task = process_document_task.delay(file_path, team_id=team_id, access_level=record.get('access_level', 0))
@@ -429,6 +428,7 @@ def reject_document(document_id: str):
     if not rejected:
         raise HTTPException(status_code=404, detail=f"Pending document not found: {document_id}")
 
+    delete_staged_file(record['file_path'])
     return {
         "message": "Document rejected.",
         "document_id": document_id,
