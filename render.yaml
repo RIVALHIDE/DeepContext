@@ -51,7 +51,15 @@ services:
       - key: ACL_ENFORCEMENT_MODE
         value: enforce
       - key: ACL_AUTO_BACKFILL
-        value: "true"
+        value: "false"
+      - key: DOCUMENT_VERSION_AUTO_MIGRATION
+        value: "false"
+      - key: INGEST_EMBED_BATCH_SIZE
+        value: "16"
+      - key: OCR_PDF_DPI
+        value: "130"
+      - key: OCR_MAX_IMAGE_DIMENSION
+        value: "2048"
       - key: NEXCONN_API_BASE_URL
         sync: false
       - key: NEXCONN_APP_KEY
