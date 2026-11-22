@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 from langchain_core.documents import Document
 
-from database import connect, is_postgres
+from database import connect, is_postgres, run_with_db_retry
 
 
 EMBEDDING_DIMENSIONS = 384  # sentence-transformers/all-MiniLM-L6-v2
@@ -171,27 +171,34 @@ class PostgresVectorStore:
         if not texts:
             return []
         embeddings = self.embedding_function.embed_documents(texts)
-        with connect() as database:
-            for vector_id, document, metadata, embedding in zip(ids, texts, metadatas, embeddings):
-                database.execute(
-                    """
-                    INSERT INTO vector_documents
-                        (vector_id, collection_name, document, metadata, embedding)
-                    VALUES (?, ?, ?, ?::jsonb, ?::vector)
-                    ON CONFLICT(vector_id) DO UPDATE SET
-                        collection_name=excluded.collection_name,
-                        document=excluded.document,
-                        metadata=excluded.metadata,
-                        embedding=excluded.embedding
-                    """,
-                    (
-                        vector_id,
-                        self.collection_name,
-                        document,
-                        json.dumps(metadata or {}),
-                        _vector_literal(embedding),
-                    ),
-                )
+        # Keep generated IDs and embeddings stable across retries. The UPSERT
+        # then makes a complete transaction retry safe and duplicate-free.
+        def write_vectors():
+            with connect() as database:
+                for vector_id, document, metadata, embedding in zip(
+                    ids, texts, metadatas, embeddings
+                ):
+                    database.execute(
+                        """
+                        INSERT INTO vector_documents
+                            (vector_id, collection_name, document, metadata, embedding)
+                        VALUES (?, ?, ?, ?::jsonb, ?::vector)
+                        ON CONFLICT(vector_id) DO UPDATE SET
+                            collection_name=excluded.collection_name,
+                            document=excluded.document,
+                            metadata=excluded.metadata,
+                            embedding=excluded.embedding
+                        """,
+                        (
+                            vector_id,
+                            self.collection_name,
+                            document,
+                            json.dumps(metadata or {}),
+                            _vector_literal(embedding),
+                        ),
+                    )
+
+        run_with_db_retry(write_vectors, operation_name="pgvector chunk write")
         return ids
 
     def add_documents(self, documents, ids=None, **kwargs):
@@ -222,16 +229,19 @@ class PostgresVectorStore:
 
     def get(self, where=None, **kwargs):
         where_sql, where_params = _where_sql(where)
-        with connect() as database:
-            rows = database.execute(
-                f"""
-                SELECT vector_id, document, metadata
-                FROM vector_documents
-                WHERE collection_name=? AND {where_sql}
-                ORDER BY created_at, vector_id
-                """,
-                (self.collection_name, *where_params),
-            ).fetchall()
+        def read_vectors():
+            with connect() as database:
+                return database.execute(
+                    f"""
+                    SELECT vector_id, document, metadata
+                    FROM vector_documents
+                    WHERE collection_name=? AND {where_sql}
+                    ORDER BY created_at, vector_id
+                    """,
+                    (self.collection_name, *where_params),
+                ).fetchall()
+
+        rows = run_with_db_retry(read_vectors, operation_name="pgvector finalization read")
         selected = [(row, _metadata(row["metadata"])) for row in rows]
         return {
             "ids": [row["vector_id"] for row, _ in selected],

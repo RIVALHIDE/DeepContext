@@ -8,7 +8,7 @@ from celery.signals import worker_ready
 from supervisor import Supervisor
 from ingest_progress import publish
 from chroma_health import log_chroma_config, wait_for_chroma
-from database import connect, initDB
+from database import connect, initDB, run_with_db_retry
 from object_storage import delete as delete_staged_file, local_copy
 from acl_security import normalize_acl_entries
 import requests
@@ -159,12 +159,20 @@ def process_document_task(
                 uploader_team=uploader_team,
                 acl_entries=acl_entries,
             )
-            with connect() as database:
-                database.execute('''INSERT INTO document_access(source_name, workspace_id, access_level)
-                                    VALUES (?, ?, ?)
-                                    ON CONFLICT(workspace_id, source_name)
-                                    DO UPDATE SET access_level=excluded.access_level''',
-                                 (os.path.basename(local_file).casefold(), team_id, access_level))
+            def finalize_document_access():
+                with connect() as database:
+                    database.execute(
+                        '''INSERT INTO document_access(source_name, workspace_id, access_level)
+                           VALUES (?, ?, ?)
+                           ON CONFLICT(workspace_id, source_name)
+                           DO UPDATE SET access_level=excluded.access_level''',
+                        (os.path.basename(local_file).casefold(), team_id, access_level),
+                    )
+
+            run_with_db_retry(
+                finalize_document_access,
+                operation_name="document access finalization",
+            )
             publish(job_id, "completed", "Ingestion complete", file_name=os.path.basename(local_file))
             if not is_slack_upload:
                 delete_staged_file(file_source)

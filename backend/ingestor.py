@@ -5,7 +5,7 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 from io import BytesIO
 import base64
 from dotenv import load_dotenv
@@ -28,9 +28,12 @@ class DataIngestor:
         )
         
     def _convert_to_base64_(self,pil_image):
+        # A compressed upload can expand into a very large bitmap. Keep vision
+        # OCR inside the memory budget of Render's 512 MB free instance.
+        max_dimension = max(1024, int(os.getenv("OCR_MAX_IMAGE_DIMENSION", "2048")))
+        pil_image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
         buffered = BytesIO()
-        
-        pil_image.save(buffered,format="JPEG")
+        pil_image.save(buffered, format="JPEG", quality=85, optimize=True)
         return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
     def _clean_doc_text(self, text: str) -> str:
@@ -288,30 +291,47 @@ class DataIngestor:
                 total_text = "".join([doc.page_content for doc in raw_docs]).strip()
                 
                 if len(total_text) < 50:
-                    print(f"⚠️ Scanned PDF detected. Processing pages sequentially to save RAM...")
-                    
-                    images = convert_from_path(filePath, dpi=150)
-                    total_pages = len(images)
-                    
-                    for i, image in enumerate(images):
-                        print(f"🔍 Vision processing page {i+1}...")
+                    print("⚠️ Scanned PDF detected. Processing one page at a time to save RAM...")
+                    # convert_from_path() without a page range renders the
+                    # entire PDF and retains every PIL image in memory. That
+                    # exceeded Render Free's memory limit on multi-page scans.
+                    total_pages = int(pdfinfo_from_path(filePath).get("Pages", 0))
+                    if total_pages < 1:
+                        raise RuntimeError("Could not determine scanned PDF page count")
+                    raw_docs.clear()
+
+                    dpi = max(96, min(int(os.getenv("OCR_PDF_DPI", "130")), 200))
+                    for page_number in range(1, total_pages + 1):
+                        print(f"🔍 Vision processing page {page_number}...")
                         if job_id:
                             publish(
                                 job_id,
                                 "ocr_processing",
-                                f"OCR page {i + 1} of {total_pages}",
+                                f"OCR page {page_number} of {total_pages}",
                                 file_name=file_name,
-                                page=i + 1,
+                                page=page_number,
                                 total_pages=total_pages,
                             )
-                        data = self._convert_to_base64_(image)
-                        descri = self.audit_image(data)
-                        
-                        final_docs.append(Document(
-                            page_content=descri,
-                            metadata={"page": i + 1}
-                        ))
-                        image.close()   
+                        page_images = convert_from_path(
+                            filePath,
+                            dpi=dpi,
+                            first_page=page_number,
+                            last_page=page_number,
+                            thread_count=1,
+                        )
+                        if not page_images:
+                            raise RuntimeError(f"Could not render PDF page {page_number}")
+                        image = page_images[0]
+                        try:
+                            data = self._convert_to_base64_(image)
+                            description = self.audit_image(data)
+                            final_docs.append(Document(
+                                page_content=description,
+                                metadata={"page": page_number},
+                            ))
+                        finally:
+                            image.close()
+                            page_images.clear()
                 else:
                     print(f"📄 Text-based PDF detected. Using fast extraction.")
                     final_docs = raw_docs

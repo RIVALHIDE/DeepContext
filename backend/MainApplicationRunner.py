@@ -35,7 +35,12 @@ from document_registry import (
     approve_pending_upload,
     reject_pending_upload,
 )
-from object_storage import delete as delete_staged_file, exists as staged_file_exists, store_upload
+from object_storage import (
+    delete as delete_staged_file,
+    exists as staged_file_exists,
+    storage_error_message,
+    store_upload,
+)
 from rag_engine import DeepContextEngine, _normalize_markdown_answer
 from webhook import router as nexconn_router
 from workspace_leaderboard import (
@@ -243,7 +248,10 @@ def bootstrap_app():
         f"Chroma bootstrap OK | collection={chroma_status.get('collection_name')} | "
         f"documents={chroma_status.get('document_count', 0)}"
     )
-    if os.getenv('ACL_AUTO_BACKFILL', 'true').strip().lower() in {'1', 'true', 'yes'}:
+    # Backfills scan the complete knowledge base and are migration commands,
+    # not normal startup work. Running them on every Render restart can exceed
+    # the free instance memory budget as the collection grows.
+    if os.getenv('ACL_AUTO_BACKFILL', 'false').strip().lower() in {'1', 'true', 'yes'}:
         acl_backfill = backfill_acl_entries(
             apply=True, vector_db=engine.get_vector_db(refresh=True),
         )
@@ -253,13 +261,16 @@ def bootstrap_app():
             f"chunks={acl_backfill['chunks_updated']} | "
             f"admin_defaults={acl_backfill['defaults_to_admin']}"
         )
-    migration = migrate_legacy_duplicate_chunks(engine.get_vector_db(refresh=True))
-    if migration["stale_chunks_deleted"] or migration["documents_processed"]:
-        print(
-            "Document versioning migration | "
-            f"documents_processed={migration['documents_processed']} | "
-            f"stale_chunks_deleted={migration['stale_chunks_deleted']}"
-        )
+    if os.getenv('DOCUMENT_VERSION_AUTO_MIGRATION', 'false').strip().lower() in {
+        '1', 'true', 'yes'
+    }:
+        migration = migrate_legacy_duplicate_chunks(engine.get_vector_db(refresh=True))
+        if migration["stale_chunks_deleted"] or migration["documents_processed"]:
+            print(
+                "Document versioning migration | "
+                f"documents_processed={migration['documents_processed']} | "
+                f"stale_chunks_deleted={migration['stale_chunks_deleted']}"
+            )
 
 
 @app.get("/health")
@@ -337,7 +348,7 @@ async def upload_docs(
         logger.exception("Object storage rejected upload for workspace %s", actor['workspace_id'])
         raise HTTPException(
             503,
-            "Upload storage is unavailable. Check the Render S3_* environment variables.",
+            storage_error_message(exc),
         ) from exc
 
     # ── Register the upload before either approval or immediate ingestion ──
@@ -569,12 +580,20 @@ async def get_job_status(job_id: str):
         status = "processing"
 
     latest = get_latest(job_id)
+    failure_message = None
+    if result.state == "FAILURE":
+        failure_message = (latest or {}).get("message")
+        if not failure_message and result.result:
+            # Only the authenticated uploader or an editor can reach this
+            # endpoint. Limit the diagnostic so exceptions cannot flood the
+            # response or expose a traceback.
+            failure_message = str(result.result).strip()[:600]
 
     return {
         "job_id": job_id,
         "status": status,
         "stage": latest.get("stage") if latest else None,
-        "message": latest.get("message") if latest else None,
+        "message": failure_message or (latest.get("message") if latest else None),
         "result": result.result if result.state == "SUCCESS" else None
     }
 

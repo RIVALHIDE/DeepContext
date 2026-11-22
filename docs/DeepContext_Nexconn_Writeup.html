@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>DeepContext — Nexconn Build Challenge Write-up</title>
+  <style>
+    @page { size: A4; margin: 14mm; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: #14213d;
+      background: #ffffff;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 10.4pt;
+      line-height: 1.5;
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { font-size: 34pt; line-height: 1.04; letter-spacing: -1.6px; margin-bottom: 10px; }
+    h2 { font-size: 19pt; line-height: 1.15; letter-spacing: -0.5px; margin-bottom: 10px; }
+    h3 { font-size: 11.5pt; margin-bottom: 5px; }
+    p { margin-bottom: 10px; }
+    .page { min-height: 267mm; position: relative; page-break-after: always; }
+    .page:last-child { page-break-after: auto; }
+    .eyebrow { color: #2764e7; font-size: 9pt; font-weight: 800; letter-spacing: 1.7px; text-transform: uppercase; }
+    .muted { color: #64748b; }
+    .lead { color: #42526e; font-size: 14pt; line-height: 1.45; max-width: 165mm; }
+    .hero {
+      padding: 14mm 13mm 12mm;
+      border-radius: 20px;
+      color: white;
+      background: linear-gradient(135deg, #0b1736 0%, #143a83 62%, #1e63e9 100%);
+      box-shadow: 0 16px 38px rgba(24, 72, 160, .18);
+    }
+    .hero .eyebrow { color: #9ec3ff; }
+    .hero .lead { color: #dbe9ff; }
+    .brand-line { display: flex; align-items: center; gap: 10px; margin-bottom: 14mm; }
+    .mark { width: 28px; height: 28px; border: 7px solid #38e3d1; border-radius: 50%; box-shadow: 0 0 0 5px rgba(56,227,209,.18); }
+    .brand { font-size: 15pt; font-weight: 800; }
+    .tag { display: inline-block; padding: 5px 9px; border: 1px solid rgba(255,255,255,.25); border-radius: 999px; color: #dbe9ff; font-size: 8.5pt; margin: 0 5px 6px 0; }
+    .app-key { margin-top: 9mm; display: inline-block; padding: 10px 14px; border-radius: 10px; background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.2); }
+    .app-key span { display: block; color: #9ec3ff; font-size: 8pt; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; }
+    .app-key strong { font-family: "SFMono-Regular", Consolas, monospace; font-size: 13pt; letter-spacing: .5px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }
+    .card { padding: 12px 13px; border: 1px solid #dbe4f2; border-radius: 12px; background: #f8fbff; break-inside: avoid; }
+    .card p:last-child { margin-bottom: 0; }
+    .icon { width: 27px; height: 27px; display: flex; align-items: center; justify-content: center; border-radius: 8px; color: #1f5de0; background: #e8f0ff; font-weight: 900; margin-bottom: 8px; }
+    .section-head { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; }
+    .section-head::before { content: ""; width: 4px; height: 28px; border-radius: 4px; background: #2d6cf3; }
+    .callout { padding: 12px 14px; border-left: 4px solid #19b89d; border-radius: 8px; background: #edfbf8; color: #174b43; }
+    .flow { display: grid; grid-template-columns: repeat(5, 1fr); align-items: stretch; gap: 12px; margin: 14px 0 18px; }
+    .flow .node { position: relative; padding: 11px 7px; text-align: center; border: 1px solid #bcd0f8; border-radius: 10px; background: #f4f8ff; font-size: 8.5pt; font-weight: 700; }
+    .flow .node:not(:last-child)::after { content: "›"; position: absolute; right: -10px; top: 50%; transform: translateY(-52%); color: #2c66dc; font-size: 18pt; }
+    .number { color: #2d6cf3; font-size: 22pt; font-weight: 850; line-height: 1; }
+    ul { margin: 5px 0 0; padding-left: 17px; }
+    li { margin-bottom: 4px; }
+    .pill { display: inline-block; padding: 4px 8px; margin: 3px 2px; border-radius: 999px; color: #275ab9; background: #edf3ff; font-size: 8.5pt; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; font-size: 9pt; }
+    th, td { padding: 8px 9px; border-bottom: 1px solid #dce5f2; text-align: left; vertical-align: top; }
+    th { color: #31517e; background: #f1f6fd; }
+    .proof { font-family: "SFMono-Regular", Consolas, monospace; font-size: 8pt; color: #345; }
+    .footer { position: absolute; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; color: #8492a8; font-size: 8pt; border-top: 1px solid #e4eaf3; padding-top: 7px; }
+    a { color: #215fd7; text-decoration: none; }
+    .metric { text-align: center; padding: 12px 8px; border-radius: 12px; color: white; background: #163c86; }
+    .metric strong { display: block; font-size: 20pt; }
+    .metric span { color: #dbe8ff; font-size: 8.5pt; }
+    .avoid-break { break-inside: avoid; }
+  </style>
+</head>
+<body>
+  <section class="page">
+    <div class="hero">
+      <div class="brand-line"><span class="mark"></span><span class="brand">DeepContext</span></div>
+      <p class="eyebrow">Nexconn Build Challenge · Project Write-up</p>
+      <h1>Trusted answers.<br>Connected teams.</h1>
+      <p class="lead">A permission-aware knowledge engine that combines grounded enterprise AI with Nexconn Chat and Call, taking teams from a question to verified evidence to live action in one secure workspace.</p>
+      <div>
+        <span class="tag">Nexconn Chat SDK</span>
+        <span class="tag">Nexconn Call SDK</span>
+        <span class="tag">Secure RAG</span>
+        <span class="tag">Workspace RBAC + ACL</span>
+      </div>
+      <div class="app-key"><span>Nexconn App Key</span><strong>4z3hlwrv4jiqt</strong></div>
+    </div>
+    <div style="margin-top:9mm" class="grid-3">
+      <div class="card"><div class="icon">1</div><h3>Discover</h3><p>Ask questions across approved internal documents and receive streamed, evidence-backed answers.</p></div>
+      <div class="card"><div class="icon">2</div><h3>Verify</h3><p>Inspect cited files, retrieved passages, answer evidence, and interactive context maps.</p></div>
+      <div class="card"><div class="icon">3</div><h3>Collaborate</h3><p>Move into Nexconn messages, file sharing, mentions, presence, and audio Huddles without losing context.</p></div>
+    </div>
+    <div class="callout" style="margin-top:6mm"><strong>Who it is for:</strong> engineering, operations, HR, compliance, support, and leadership teams that need fast knowledge access without weakening document governance.</div>
+    <div class="footer"><span>DeepContext · Nexconn Build Challenge</span><span>1 / 4</span></div>
+  </section>
+
+  <section class="page">
+    <p class="eyebrow">Why we built it</p>
+    <div class="section-head"><h2 style="margin:0">The problem: knowledge and collaboration are disconnected</h2></div>
+    <p class="lead" style="font-size:12.5pt">Important answers live across reports, meeting notes, Office files, images, and architecture diagrams. Generic AI search can expose sensitive material, while separate chat and meeting products force teams to copy answers out of context.</p>
+    <div class="grid-3" style="margin:12px 0 17px">
+      <div class="card"><div class="number">01</div><h3>Slow discovery</h3><p>People manually search multiple files and repeatedly ask teammates for the same facts.</p></div>
+      <div class="card"><div class="number">02</div><h3>Security risk</h3><p>Prompt-only safeguards cannot prevent restricted chunks from reaching an AI model.</p></div>
+      <div class="card"><div class="number">03</div><h3>Broken handoff</h3><p>Knowledge discovery, discussion, file exchange, and calls happen in separate tools.</p></div>
+    </div>
+
+    <p class="eyebrow">How DeepContext solves it</p>
+    <div class="section-head"><h2 style="margin:0">One governed path from upload to action</h2></div>
+    <div class="flow">
+      <div class="node">Upload and validate</div>
+      <div class="node">Review and approve</div>
+      <div class="node">Extract and index</div>
+      <div class="node">Retrieve and verify</div>
+      <div class="node">Discuss or Huddle</div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Governed ingestion</h3>
+        <ul>
+          <li>Mixed multi-file upload with isolated per-file progress and errors</li>
+          <li>PDF, text, Markdown, images, Office, Mermaid, and PlantUML support</li>
+          <li>Member approval queue; editor-or-higher immediate indexing</li>
+          <li>Private object storage for uploaded originals</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Grounded intelligence</h3>
+        <ul>
+          <li>pgvector semantic retrieval plus BM25 keyword ranking</li>
+          <li>Groq-hosted Llama answer generation with streaming</li>
+          <li>LangGraph reflection checks the draft against retrieved evidence</li>
+          <li>Inspectable files, passages, citations, and diagram sources</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout" style="margin-top:12px"><strong>Zero-trust retrieval:</strong> workspace, user, group, and role ACL filters run inside the vector query before top-K selection. Unauthorized content and filenames never enter the LLM prompt.</div>
+    <div class="footer"><span>Problem and solution</span><span>2 / 4</span></div>
+  </section>
+
+  <section class="page">
+    <p class="eyebrow">Proof of Nexconn integration</p>
+    <div class="section-head"><h2 style="margin:0">Nexconn is the collaboration layer—not a decorative embed</h2></div>
+    <p>DeepContext uses a custom interface built directly on the <strong>Nexconn Chat SDK</strong> and <strong>Nexconn Call SDK</strong>. The FastAPI backend keeps the App Secret server-side, issues access tokens, registers opaque provider identities, and deterministically derives one stable Nexconn group channel for every authenticated DeepContext workspace. Switching workspaces therefore switches the collaboration boundary automatically.</p>
+
+    <div class="grid-2" style="margin:13px 0">
+      <div class="card">
+        <div class="icon">C</div>
+        <h3>Nexconn Chat SDK</h3>
+        <ul>
+          <li>Workspace group channels and message history</li>
+          <li>Real-time send, receive, and message updates</li>
+          <li>Online/offline member presence</li>
+          <li>WhatsApp-style typing indicators</li>
+          <li>Named senders and @mentions</li>
+          <li>Edit-your-own-message workflow</li>
+          <li>Downloadable file attachments with upload progress</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="icon">H</div>
+        <h3>Nexconn Call SDK</h3>
+        <ul>
+          <li>One active audio Huddle per workspace</li>
+          <li>Owner starts the room; teammates join the same call</li>
+          <li>Call identity is derived from authenticated workspace membership</li>
+          <li>Collaboration stays beside the knowledge and evidence panels</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="callout"><strong>Governed file collaboration:</strong> any member can share a file through Nexconn. Compatible knowledge files become proposals, but only an editor, admin, or owner can add them to the indexed workspace. Chat never bypasses approval or ACL controls.</div>
+
+    <h3 style="margin-top:15px">Security boundary</h3>
+    <table>
+      <tr><th>Browser receives</th><th>Backend retains</th><th>Workspace enforcement</th></tr>
+      <tr><td>App Key, scoped access token, derived channel ID, current member mapping</td><td>App Secret, JWT signing secret, storage credentials, database credentials</td><td>Channel and Huddle derive only from the verified JWT workspace; client workspace claims are ignored</td></tr>
+    </table>
+
+    <h3 style="margin-top:15px">Integration proof in the public repository</h3>
+    <div class="card proof">
+      frontend/src/components/NexconnChat.jsx<br>
+      frontend/src/components/NexconnHuddle.jsx<br>
+      frontend/src/utils/nexconnClient.util.js<br>
+      backend/webhook.py
+    </div>
+    <div class="footer"><span>Nexconn Chat SDK + Call SDK</span><span>3 / 4</span></div>
+  </section>
+
+  <section class="page">
+    <p class="eyebrow">Product depth and implementation</p>
+    <div class="section-head"><h2 style="margin:0">Built for trustworthy knowledge work</h2></div>
+    <div class="grid-3">
+      <div class="card"><h3>Workspace RBAC</h3><p>Viewer, member, editor, admin, and owner roles with explicit management capabilities.</p></div>
+      <div class="card"><h3>Normalized ACLs</h3><p>Public, user, group, and role tokens replicated to documents and every vector chunk.</p></div>
+      <div class="card"><h3>Anti-leakage</h3><p>Uniform refusals prevent disclosure of restricted titles, counts, or document existence.</p></div>
+      <div class="card"><h3>Evidence panel</h3><p>Answer citations show the exact permitted files, chunks, and passages retrieved.</p></div>
+      <div class="card"><h3>Context maps</h3><p>Mermaid and PlantUML become interactive React Flow diagrams with saved history.</p></div>
+      <div class="card"><h3>Contribution loop</h3><p>Approved uploads and cited evidence drive an auditable, workspace-specific leaderboard.</p></div>
+    </div>
+
+    <h3 style="margin-top:17px">Technology and deployment</h3>
+    <table>
+      <tr><th>Layer</th><th>Technology</th><th>Purpose</th></tr>
+      <tr><td>Experience</td><td>React 19, Vite, Tailwind-style utilities, React Flow</td><td>Three-panel workspace, streaming chat, evidence review, context maps</td></tr>
+      <tr><td>API and jobs</td><td>FastAPI, Celery-compatible pipeline, Upstash Redis</td><td>Authentication, upload validation, ingestion, progress, Nexconn session brokering</td></tr>
+      <tr><td>Knowledge</td><td>Neon PostgreSQL + pgvector, BM25, Hugging Face embeddings</td><td>Persistent relational state, query-time ACL filtering, and hybrid retrieval</td></tr>
+      <tr><td>AI</td><td>Groq Llama models, LangChain, LangGraph</td><td>Document extraction, grounded generation, and reflection</td></tr>
+      <tr><td>Storage</td><td>Neon Object Storage / S3-compatible API</td><td>Private, durable originals shared by API and ingestion jobs</td></tr>
+      <tr><td>Hosting</td><td>Vercel frontend + Render Docker API</td><td>Public production deployment with health checks</td></tr>
+    </table>
+
+    <div class="grid-3" style="margin-top:10px">
+      <div class="metric"><strong>2</strong><span>Nexconn SDKs integrated</span></div>
+      <div class="metric"><strong>5</strong><span>workspace access roles</span></div>
+      <div class="metric"><strong>1</strong><span>workflow from evidence to action</span></div>
+    </div>
+
+    <div class="callout" style="margin-top:9px; padding:9px 12px"><strong>Result:</strong> DeepContext turns fragmented organizational knowledge into secure, verifiable answers and gives teams the Nexconn communication tools to act on those answers immediately.</div>
+
+    <div style="margin-top:8px; padding:8px 12px; font-size:9pt; line-height:1.3" class="card">
+      <strong>Public repository:</strong> <a href="https://github.com/RIVALHIDE/DeepContext">github.com/RIVALHIDE/DeepContext</a><br>
+      <strong>Live application:</strong> <a href="https://deep-context-eosin.vercel.app">deep-context-eosin.vercel.app</a><br>
+      <strong>Nexconn App Key:</strong> <span class="proof">4z3hlwrv4jiqt</span>
+    </div>
+    <div class="footer"><span>DeepContext · Trusted answers, connected teams</span><span>4 / 4</span></div>
+  </section>
+</body>
+</html>

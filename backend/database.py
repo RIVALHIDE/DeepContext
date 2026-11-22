@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import os
+import random
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
+from typing import Callable, TypeVar
 
 from dotenv import load_dotenv
 
@@ -138,6 +141,66 @@ def connect(path: str | None = None):
     return connection
 
 
+T = TypeVar("T")
+
+
+def _postgres_error_code(exc: BaseException) -> str:
+    """Return the first PostgreSQL SQLSTATE found in an exception chain."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = str(getattr(current, "sqlstate", "") or "")
+        if code:
+            return code
+        current = current.__cause__ or current.__context__
+    return ""
+
+
+def is_transient_database_error(exc: BaseException) -> bool:
+    """Identify PostgreSQL failures that are safe to retry as a transaction.
+
+    Neon can briefly close or reject a pooled connection while its compute is
+    waking or being recycled.  We deliberately do not retry integrity,
+    permission, syntax, or other permanent database errors.
+    """
+    if not is_postgres() or psycopg is None:
+        return False
+    code = _postgres_error_code(exc)
+    if code.startswith("08") or code in {"40001", "40P01", "57P01", "57P02", "57P03"}:
+        return True
+    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError))
+
+
+def run_with_db_retry(
+    operation: Callable[[], T],
+    *,
+    operation_name: str = "database operation",
+    attempts: int | None = None,
+) -> T:
+    """Run one idempotent DB transaction with bounded transient retries."""
+    configured_attempts = attempts or int(os.getenv("DB_WRITE_RETRY_ATTEMPTS", "4"))
+    max_attempts = max(1, min(configured_attempts, 8))
+    base_delay = max(0.05, float(os.getenv("DB_WRITE_RETRY_DELAY_SECONDS", "0.5")))
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if attempt >= max_attempts or not is_transient_database_error(exc):
+                raise
+            delay = min(base_delay * (2 ** (attempt - 1)), 5.0)
+            delay += random.uniform(0, min(delay * 0.2, 0.25))
+            print(
+                f"Transient PostgreSQL error during {operation_name}; "
+                f"retrying attempt {attempt + 1}/{max_attempts} in {delay:.2f}s "
+                f"(sqlstate={_postgres_error_code(exc) or 'unavailable'})"
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"{operation_name} retry loop ended unexpectedly")
+
+
 def _init_postgres():
     with connect() as conn:
         conn.executescript(
@@ -170,7 +233,7 @@ def _init_postgres():
                 status TEXT NOT NULL DEFAULT 'pending_approval',
                 uploaded_by TEXT DEFAULT 'anonymous', team_id TEXT DEFAULT 'default',
                 uploaded_at TEXT, approved_at TEXT, approved_by TEXT, job_id TEXT,
-                access_level INTEGER NOT NULL DEFAULT 0,
+                access_level DOUBLE PRECISION NOT NULL DEFAULT 0,
                 acl_entries TEXT NOT NULL DEFAULT '["role:admin"]'
             );
             CREATE TABLE IF NOT EXISTS workspace_groups (
@@ -227,7 +290,7 @@ def _init_postgres():
             ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS retrieval_grounded INTEGER;
             ALTER TABLE documents ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT 'default';
             ALTER TABLE documents ADD COLUMN IF NOT EXISTS acl_entries TEXT NOT NULL DEFAULT '["role:admin"]';
-            ALTER TABLE pending_uploads ADD COLUMN IF NOT EXISTS access_level INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE pending_uploads ADD COLUMN IF NOT EXISTS access_level DOUBLE PRECISION NOT NULL DEFAULT 0;
             ALTER TABLE pending_uploads ADD COLUMN IF NOT EXISTS acl_entries TEXT NOT NULL DEFAULT '["role:admin"]';
             ALTER TABLE retrieval_audit_log ADD COLUMN IF NOT EXISTS acl_scope_summary TEXT NOT NULL DEFAULT '{}';
             """
@@ -280,7 +343,7 @@ def _init_sqlite():
             status TEXT NOT NULL DEFAULT 'pending_approval',
             uploaded_by TEXT DEFAULT 'anonymous', team_id TEXT DEFAULT 'default',
             uploaded_at TEXT, approved_at TEXT, approved_by TEXT, job_id TEXT,
-            access_level INTEGER NOT NULL DEFAULT 0,
+            access_level REAL NOT NULL DEFAULT 0,
             acl_entries TEXT NOT NULL DEFAULT '["role:admin"]'
         );
         CREATE TABLE IF NOT EXISTS workspace_groups (

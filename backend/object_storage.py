@@ -16,7 +16,12 @@ from database import DATA_DIR
 
 
 def _bucket() -> str:
-    return os.getenv("S3_BUCKET", "").strip()
+    return (
+        os.getenv("S3_BUCKET")
+        or os.getenv("AWS_S3_BUCKET")
+        or os.getenv("AWS_BUCKET_NAME")
+        or ""
+    ).strip()
 
 
 def is_remote_storage() -> bool:
@@ -29,7 +34,14 @@ def _client():
     import boto3
     from botocore.config import Config
 
-    endpoint = os.getenv("S3_ENDPOINT_URL", "").strip()
+    # Neon exports standard AWS-style names. Keep the S3_* aliases used by the
+    # Render blueprint so either credential format works without renaming.
+    endpoint = (
+        os.getenv("S3_ENDPOINT_URL")
+        or os.getenv("AWS_ENDPOINT_URL_S3")
+        or os.getenv("AWS_ENDPOINT_URL")
+        or ""
+    ).strip().rstrip("/")
     access_key = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
     secret_key = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
     if not endpoint or not access_key or not secret_key:
@@ -41,11 +53,48 @@ def _client():
     return boto3.client(
         "s3",
         endpoint_url=endpoint,
-        region_name=os.getenv("S3_REGION", "auto"),
+        region_name=(
+            os.getenv("S3_REGION")
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or "us-east-2"
+        ),
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
-        config=Config(s3={"addressing_style": "path"}),
+        config=Config(
+            signature_version="s3v4",
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 2, "mode": "standard"},
+            s3={"addressing_style": "path"},
+        ),
     )
+
+
+def storage_error_message(error: Exception) -> str:
+    """Return actionable storage diagnostics without exposing credentials."""
+    try:
+        from botocore.exceptions import ClientError, EndpointConnectionError
+
+        if isinstance(error, ClientError):
+            details = error.response.get("Error", {})
+            code = str(details.get("Code") or "S3Error")
+            messages = {
+                "AccessDenied": "the storage credential cannot write to this bucket",
+                "InvalidAccessKeyId": "the storage access key is invalid",
+                "SignatureDoesNotMatch": "the storage secret or region is incorrect",
+                "NoSuchBucket": "the configured bucket does not exist",
+                "AuthorizationHeaderMalformed": "the configured storage region is incorrect",
+            }
+            reason = messages.get(code, "verify the bucket and credentials")
+            return f"Object storage rejected the upload ({code}): {reason}"
+        if isinstance(error, EndpointConnectionError):
+            return "Object storage endpoint is unreachable; verify S3_ENDPOINT_URL or AWS_ENDPOINT_URL_S3"
+    except ImportError:
+        pass
+    if isinstance(error, RuntimeError):
+        return str(error)
+    return f"Object storage upload failed ({type(error).__name__})"
 
 
 def _reference(key: str) -> str:

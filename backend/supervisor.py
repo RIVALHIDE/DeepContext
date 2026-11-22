@@ -147,7 +147,9 @@ class Supervisor:
 
             document_id, version = self._supersede_existing_document(vector_db, file_name, team_id)
 
-            batch_size = 20  
+            # Embed and commit small batches. Accumulating every embedding in
+            # one call can exceed the 512 MB Render Free memory limit.
+            batch_size = max(1, min(int(os.getenv("INGEST_EMBED_BATCH_SIZE", "16")), 64))
             processed_chunks = []
             
             for i in range(0, len(new_chunks), batch_size):
@@ -167,17 +169,18 @@ class Supervisor:
                         **chunk_acl_metadata,
                     })
                     processed_chunks.append(chunk)
+                if job_id:
+                    completed = min(i + len(current_batch), len(new_chunks))
+                    publish(
+                        job_id,
+                        "indexing",
+                        f"Saving chunks {i + 1}-{completed} of {len(new_chunks)}",
+                        file_name=file_name,
+                        chunk_count=len(new_chunks),
+                        chunks_written=completed,
+                    )
+                vector_db.add_documents(current_batch)
 
-            if job_id:
-                publish(
-                    job_id,
-                    "indexing",
-                    f"Writing {len(processed_chunks)} chunks to ChromaDB",
-                    file_name=file_name,
-                    chunk_count=len(processed_chunks),
-                )
-
-            vector_db.add_documents(processed_chunks)
             self.engine._try_persist()
             chunk_ids = self._register_indexed_chunks(
                 vector_db,

@@ -60,13 +60,17 @@ def init_auth():
         CREATE TABLE IF NOT EXISTS login_attempts (key TEXT NOT NULL, attempted INTEGER NOT NULL);
         ''')
         if is_postgres():
-            db.execute('ALTER TABLE pending_uploads ADD COLUMN IF NOT EXISTS access_level INTEGER NOT NULL DEFAULT 0')
+            db.execute('ALTER TABLE pending_uploads ADD COLUMN IF NOT EXISTS access_level DOUBLE PRECISION NOT NULL DEFAULT 0')
+            db.execute(
+                'ALTER TABLE pending_uploads ALTER COLUMN access_level '
+                'TYPE DOUBLE PRECISION USING access_level::double precision'
+            )
             db.execute('CREATE INDEX IF NOT EXISTS idx_document_access_workspace ON document_access(workspace_id)')
             return
 
         columns = {row[1] for row in db.execute('PRAGMA table_info(pending_uploads)')}
         if 'access_level' not in columns:
-            db.execute('ALTER TABLE pending_uploads ADD COLUMN access_level INTEGER NOT NULL DEFAULT 0')
+            db.execute('ALTER TABLE pending_uploads ADD COLUMN access_level REAL NOT NULL DEFAULT 0')
 
         # Older installations keyed document access by source_name alone.
         # Rebuild it with a composite workspace key so identical filenames can

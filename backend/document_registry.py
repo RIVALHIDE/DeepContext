@@ -4,7 +4,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 
-from database import DB_PATH, connect, initDB, is_postgres
+from database import DB_PATH, connect, initDB, is_postgres, run_with_db_retry
 from acl_security import (
     acl_metadata,
     minimum_role_acl,
@@ -104,59 +104,66 @@ def upsert_document(
     workspace_id = _workspace(workspace_id)
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     acl_tokens = normalize_acl_entries(acl_entries)
-    conn = _connect()
-    try:
-        conn.execute(
-            """
-            INSERT INTO documents (
-                document_id,
-                source_name,
-                workspace_id,
-                current_version,
-                chunk_ids,
-                ingested_at,
-                acl_entries,
-                status,
-                created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(workspace_id, source_name) DO UPDATE SET
-                document_id = excluded.document_id,
-                current_version = excluded.current_version,
-                chunk_ids = excluded.chunk_ids,
-                ingested_at = excluded.ingested_at,
-                acl_entries = excluded.acl_entries,
-                status = excluded.status,
-                updated_at = excluded.updated_at
-            """,
-            (
-                document_id,
-                normalized,
-                workspace_id,
-                current_version,
-                json.dumps(chunk_ids),
-                ingested_at,
-                json.dumps(acl_tokens),
-                status,
-                now,
-                now,
-            ),
-        )
-        conn.execute(
-            "DELETE FROM document_acl_entries WHERE workspace_id=? AND document_id=?",
-            (workspace_id, document_id),
-        )
-        for token in acl_tokens:
+
+    def write_registry():
+        conn = _connect()
+        try:
             conn.execute(
-                """INSERT INTO document_acl_entries
-                   (workspace_id, document_id, acl_token, updated_at)
-                   VALUES (?, ?, ?, ?)""",
-                (workspace_id, document_id, token, now),
+                """
+                INSERT INTO documents (
+                    document_id,
+                    source_name,
+                    workspace_id,
+                    current_version,
+                    chunk_ids,
+                    ingested_at,
+                    acl_entries,
+                    status,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workspace_id, source_name) DO UPDATE SET
+                    document_id = excluded.document_id,
+                    current_version = excluded.current_version,
+                    chunk_ids = excluded.chunk_ids,
+                    ingested_at = excluded.ingested_at,
+                    acl_entries = excluded.acl_entries,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    document_id,
+                    normalized,
+                    workspace_id,
+                    current_version,
+                    json.dumps(chunk_ids),
+                    ingested_at,
+                    json.dumps(acl_tokens),
+                    status,
+                    now,
+                    now,
+                ),
             )
-        conn.commit()
-        return get_document(normalized, workspace_id)
-    finally:
-        conn.close()
+            conn.execute(
+                "DELETE FROM document_acl_entries WHERE workspace_id=? AND document_id=?",
+                (workspace_id, document_id),
+            )
+            for token in acl_tokens:
+                conn.execute(
+                    """INSERT INTO document_acl_entries
+                       (workspace_id, document_id, acl_token, updated_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (workspace_id, document_id, token, now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    run_with_db_retry(write_registry, operation_name="document registry finalization")
+    return run_with_db_retry(
+        lambda: get_document(normalized, workspace_id),
+        operation_name="document registry verification",
+    )
 
 
 def delete_document_record(source_name: str, workspace_id: str) -> bool:

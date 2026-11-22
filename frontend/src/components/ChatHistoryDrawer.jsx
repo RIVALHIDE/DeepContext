@@ -125,7 +125,7 @@ export default function ChatHistoryDrawer({
             message: message || STAGE_LABELS.failed,
             meta: { file_name: batchLabel },
           });
-          return { ok: false };
+          return { ok: false, message: message || STAGE_LABELS.failed };
         }
       } catch {
         onIngestFailed?.({ message: 'Error while checking job status.' });
@@ -159,13 +159,13 @@ export default function ChatHistoryDrawer({
       });
       const result = progressResult.fallback
         ? await pollJobStatus(job.jobId, job.file.name, batchLabel)
-        : { ok: progressResult.ok };
+        : { ok: progressResult.ok, message: progressResult.event?.message };
       if (result.ok) {
         completed += 1;
         updateBatchRow(job.index, { status: 'completed', detail: 'Ready in knowledge base' });
       } else {
         failed += 1;
-        updateBatchRow(job.index, { status: 'failed', detail: progressResult.event?.message || STAGE_LABELS.failed });
+        updateBatchRow(job.index, { status: 'failed', detail: result.message || STAGE_LABELS.failed });
       }
       onIngestEvent?.({
         stage: failed ? 'processing' : 'indexing',
@@ -200,6 +200,7 @@ export default function ChatHistoryDrawer({
     let pendingCount = 0;
     let accepted = 0;
     let failed = rows.length - valid.length;
+    let firstFailure = rows.find((row) => row.detail)?.detail || '';
 
     for (const item of valid) {
       updateBatchRow(item.index, { status: 'uploading', detail: 'Uploading to server…' });
@@ -221,9 +222,17 @@ export default function ChatHistoryDrawer({
       } catch (error) {
         failed += 1;
         const detail = error?.response?.data?.detail;
+        const failureDetail = typeof detail === 'string'
+          ? detail
+          : error?.code === 'ECONNABORTED'
+            ? 'Upload timed out while the API or storage service was waking up'
+            : error?.message === 'Network Error'
+              ? 'Network or CORS error while contacting the upload API'
+              : `Upload failed${error?.response?.status ? ` (HTTP ${error.response.status})` : ''}`;
+        if (!firstFailure) firstFailure = failureDetail;
         updateBatchRow(item.index, {
           status: 'failed',
-          detail: typeof detail === 'string' ? detail : `Upload failed${error?.response?.status ? ` (HTTP ${error.response.status})` : ''}`,
+          detail: failureDetail,
         });
       }
     }
@@ -241,7 +250,9 @@ export default function ChatHistoryDrawer({
     } else if (accepted) {
       await onIngestComplete?.();
     }
-    if (failed) setUploadError(`${failed} file${failed === 1 ? '' : 's'} could not be accepted. The remaining files were not interrupted.`);
+    if (failed) {
+      setUploadError(`${failed} file${failed === 1 ? '' : 's'} could not be accepted.${firstFailure ? ` ${firstFailure}` : ''}`);
+    }
     if (jobs.length) monitorBatchJobs(jobs, batchLabel);
   };
 
@@ -347,7 +358,7 @@ export default function ChatHistoryDrawer({
               {batchRows.map((row, index) => <div key={`${row.file.name}-${index}`} className="flex items-center gap-2 rounded-lg px-2.5 py-2" style={{ background: 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}>
                 <span className="w-2 h-2 rounded-full shrink-0" style={{ background: row.status === 'failed' ? 'var(--dc-red)' : row.status === 'completed' ? 'var(--dc-green)' : row.status === 'pending' ? '#f59e0b' : 'var(--dc-brand)' }} />
                 <span className="min-w-0 flex-1 text-[11px] font-medium truncate">{row.file.name}</span>
-                <span className="max-w-[45%] text-[9px] text-right truncate" style={{ color: row.status === 'failed' ? 'var(--dc-red)' : 'var(--dc-text-muted)' }}>{row.detail}</span>
+                <span className="max-w-[55%] text-[9px] text-right leading-tight" title={row.detail} style={{ color: row.status === 'failed' ? 'var(--dc-red)' : 'var(--dc-text-muted)' }}>{row.detail}</span>
               </div>)}
             </div>}
 

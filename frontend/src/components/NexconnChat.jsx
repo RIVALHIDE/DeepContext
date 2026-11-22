@@ -49,9 +49,14 @@ function sameChannel(message, channel) {
     && (channel.type !== 'community' || identifier?.subChannelId === channel.subchannel_id);
 }
 
-function normalizeMessage(message, currentUser) {
+function memberNameForProvider(providerId, members) {
+  return (members || []).find((member) => member.provider_id === providerId)?.name || '';
+}
+
+function normalizeMessage(message, currentUser, members = []) {
   const sender = message.content?.senderUserInfo;
   const mine = message.senderUserId === currentUser?.providerId;
+  const workspaceMemberName = memberNameForProvider(message.senderUserId, members);
   let extra = {};
   try {
     extra = JSON.parse(message.content?.extra || '{}');
@@ -64,7 +69,12 @@ function normalizeMessage(message, currentUser) {
     id: message.messageId || `local-${message.clientId}-${message.sentTime}`,
     text: isFile ? '' : (message.content?.text || message.content?.content || `[${message.messageType || 'message'}]`),
     senderId: message.senderUserId,
-    senderName: mine ? currentUser.name : (sender?.name || message.content?.senderName || message.senderUserId || 'Unknown user'),
+    // Nexconn messages identify senders with an opaque provider ID. Resolve
+    // that ID through the authenticated workspace member list rather than
+    // exposing the internal hash in the conversation UI.
+    senderName: mine
+      ? currentUser.name
+      : (workspaceMemberName || sender?.name || message.content?.senderName || 'Workspace member'),
     sentTime: message.sentTime || Date.now(),
     channelIdentifier: message.channelIdentifier,
     edited: Boolean(message.hasChanged || message.updateInfo),
@@ -125,14 +135,19 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
   const typingTimersRef = useRef(new Map());
   const lastTypingSentRef = useRef(0);
   const sessionRef = useRef(null);
+  const membersRef = useRef([]);
   const inputRef = useRef(null);
   const attachmentInputRef = useRef(null);
 
   const applyPresence = useCallback((statuses) => {
     const onlineById = new Map((statuses || []).map((item) => [item.userId, subscriptionIsOnline(item)]));
-    setMembers((previous) => previous.map((member) => member.provider_id === sessionRef.current?.user_id
-      ? { ...member, online: true }
-      : onlineById.has(member.provider_id) ? { ...member, online: onlineById.get(member.provider_id) } : member));
+    setMembers((previous) => {
+      const next = previous.map((member) => member.provider_id === sessionRef.current?.user_id
+        ? { ...member, online: true }
+        : onlineById.has(member.provider_id) ? { ...member, online: onlineById.get(member.provider_id) } : member);
+      membersRef.current = next;
+      return next;
+    });
   }, []);
 
   const addMessages = useCallback((incoming) => {
@@ -141,7 +156,7 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
       incoming.map((message) => normalizeMessage(message, {
         providerId: sessionRef.current?.user_id,
         name: user?.name || user?.username || 'You',
-      })).forEach((message) => byId.set(message.id, message));
+      }, membersRef.current)).forEach((message) => byId.set(message.id, message));
       return [...byId.values()].sort((left, right) => left.sentTime - right.sentTime);
     });
   }, [user?.name, user?.username]);
@@ -150,9 +165,10 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
     const senderId = message.senderUserId;
     if (!senderId || senderId === sessionRef.current?.user_id) return;
     const typing = message.content?.typing !== false;
-    const name = message.content?.senderName
+    const name = memberNameForProvider(senderId, membersRef.current)
+      || message.content?.senderName
       || message.content?.senderUserInfo?.name
-      || senderId;
+      || 'Workspace member';
     const previousTimer = typingTimersRef.current.get(senderId);
     if (previousTimer) window.clearTimeout(previousTimer);
     if (!typing) {
@@ -201,10 +217,12 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
         }
         setSession(data);
         sessionRef.current = data;
-        setMembers((data.members || []).map((member) => ({
+        const initialMembers = (data.members || []).map((member) => ({
           ...member,
           online: member.provider_id === data.user_id,
-        })));
+        }));
+        membersRef.current = initialMembers;
+        setMembers(initialMembers);
         const { chat: sdk } = await connectNexconn(data);
         sdkRef.current = sdk;
         if (cancelled) return;
@@ -552,10 +570,13 @@ function NexconnChannel({ user, onIngestStart, onIngestEvent, onIngestComplete, 
       {!messages.length && <div className="h-full flex items-center justify-center text-sm" style={{ color: 'var(--dc-text-muted)' }}>No messages in this channel yet.</div>}
       {messages.map((message) => {
         const mine = message.senderId === session?.user_id;
+        const displaySenderName = mine
+          ? (user?.name || user?.username || message.senderName || 'You')
+          : (memberNameForProvider(message.senderId, members) || message.senderName || 'Workspace member');
         const isEditing = editingMessageId === message.id;
         return <div key={message.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
           <div className="group max-w-[75%] rounded-2xl px-4 py-2.5" style={{ background: mine ? 'var(--dc-brand-dim)' : 'var(--dc-surface-1)', border: '1px solid var(--dc-border)' }}>
-            <p className="text-[10px] font-semibold mb-1" style={{ color: mine ? 'var(--dc-text-secondary)' : 'var(--dc-brand)' }}>{mine ? `${message.senderName} · You` : message.senderName}</p>
+            <p className="text-[10px] font-semibold mb-1" style={{ color: mine ? 'var(--dc-text-secondary)' : 'var(--dc-brand)' }}>{mine ? `${displaySenderName} · You` : displaySenderName}</p>
             {message.attachment ? <div className="min-w-[230px] max-w-sm rounded-xl p-3" style={{ background: 'var(--dc-surface-0)', border: '1px solid var(--dc-border-strong)' }}>
               <div className="flex items-center gap-2.5">
                 <span className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{ background: 'var(--dc-brand-dim)', color: 'var(--dc-brand)' }}><FileText size={17} /></span>
